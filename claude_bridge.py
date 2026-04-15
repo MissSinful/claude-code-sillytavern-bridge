@@ -412,27 +412,27 @@ def save_summary_to_cache(conv_hash, summary_data, message_count=0):
 def get_auto_summary_cache(char_key=None):
     """Get the auto-summary cache entry for a given character.
 
-    Entries live under keys of the form 'auto_<char_key>'. For backwards
-    compatibility, falls back to the legacy 'auto' or 'latest' keys — and
-    on first hit, migrates the legacy 'auto' entry to the current character's
-    slot so existing users don't lose their in-progress summary when upgrading.
+    Entries live under keys of the form 'auto_<char_key>'. Returns the entry
+    for the given char_key if one exists, otherwise None.
+
+    Legacy 'auto' and 'latest' entries from pre-per-character versions are
+    NOT auto-migrated anymore — that heuristic was dangerous: it assumed the
+    first character seen after upgrade owned the legacy entry, which produced
+    mis-keyed entries if the user had switched characters between upgrade and
+    next request. Orphaned legacy entries are surfaced in the GUI cache panel
+    so users can delete or recover them manually.
     """
     cache = get_cache()
     if char_key:
         keyed = f"auto_{char_key}"
         if keyed in cache:
             return cache.get(keyed)
-        # First-run migration: there's exactly one legacy entry and we now know
-        # which character it belongs to (the active one). Rename it in place.
-        if "auto" in cache:
-            log(f"Migrating legacy 'auto' → 'auto_{char_key}' for current character", "INFO")
-            cache[keyed] = cache.pop("auto")
-            save_cache(cache)
-            return cache.get(keyed)
-    elif "auto" in cache:
+        return None
+    # No char_key supplied (shouldn't happen in the normal flow). Fall back
+    # to the legacy keys if present, for read-only inspection purposes.
+    if "auto" in cache:
         return cache.get("auto")
     if "latest" in cache:
-        log("Using legacy 'latest' summary - will migrate to 'auto' on next update")
         return cache.get("latest")
     return None
 
@@ -545,6 +545,28 @@ def process_auto_summary(messages):
             summarized_up_to = max(0, current_count - RECENT_CONTEXT_COUNT)
             save_auto_summary(existing_summary, current_count, summarized_up_to, char_key)
 
+        # Sanity check: if the cached entry claims MORE messages than this
+        # request has, it belongs to a different/older conversation. This
+        # happens when a legacy 'auto' entry got migrated to the wrong
+        # character's key in earlier versions, or when a user imports a
+        # fresh chat over an existing cache slot. Refuse to apply a summary
+        # from a bigger conversation to a smaller one — the content almost
+        # certainly doesn't match. Start fresh; the next threshold-sized
+        # summarization will overwrite the stale entry at the same slot.
+        if last_check_count > current_count:
+            log(
+                f"Auto-summary [{char_key}]: stale entry detected "
+                f"(cached last_count={last_check_count} > current={current_count}). "
+                f"Ignoring stale summary — fresh one will overwrite on next threshold.",
+                "WARN",
+            )
+            # Fall through as if there were no cache. Don't delete the entry
+            # here; let the next save_auto_summary overwrite naturally, and
+            # let the user decide via the GUI if they want to remove it now.
+            cached = None
+            existing_summary = ""
+
+    if cached:
         new_message_count = current_count - last_check_count
 
         log(f"Auto-summary [{char_key}]: {current_count} msgs total, {new_message_count} new | Summary covers → msg {summarized_up_to}", "INFO")
