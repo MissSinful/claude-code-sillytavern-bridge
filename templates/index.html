@@ -1,0 +1,2230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Code ↔ SillyTavern Bridge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --ink: #0f0c0a;
+            --ink-raised: #17120f;
+            --ink-hover: #221a15;
+            --ink-sunk: #0a0807;
+            --rule: #3b2e26;
+            --rule-faint: #1f1712;
+            --paper: #f4ede1;
+            --paper-dim: #b8a999;
+            --paper-faint: #7d6e5f;
+            --paper-ghost: #4a3f36;
+            --accent: #d4461d;
+            --accent-soft: #e86a3d;
+            --accent-dim: #8a2a13;
+            --success: #8a9541;
+            --warn: #c99545;
+            --error: #a23d2a;
+            --gold: #c69a5a;
+
+            --font-display: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+            --font-body: 'Newsreader', Georgia, 'Times New Roman', serif;
+            --font-mono: 'IBM Plex Mono', Menlo, Consolas, monospace;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-body);
+            font-weight: 400;
+            font-size: 15px;
+            line-height: 1.6;
+            background: var(--ink);
+            color: var(--paper);
+            min-height: 100vh;
+            font-feature-settings: 'kern', 'liga', 'onum';
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Paper grain overlay for depth */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 100;
+            opacity: 0.04;
+            mix-blend-mode: overlay;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+        }
+
+        /* Soft vignette at top */
+        body::after {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 400px;
+            pointer-events: none;
+            z-index: 99;
+            background: radial-gradient(ellipse at top, rgba(212, 70, 29, 0.04) 0%, transparent 70%);
+        }
+
+        .container {
+            max-width: 1120px;
+            margin: 0 auto;
+            padding: 72px 56px 96px;
+            position: relative;
+        }
+
+        /* ========== PAGE LOAD STAGGER ========== */
+        @keyframes riseIn {
+            from { opacity: 0; transform: translateY(14px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .masthead,
+        .tabs,
+        .panel.active {
+            animation: riseIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+        .masthead { animation-delay: 0.05s; }
+        .tabs     { animation-delay: 0.18s; }
+        .panel.active { animation-delay: 0.32s; }
+
+        /* ========== MASTHEAD ========== */
+        .masthead {
+            border-bottom: 1px solid var(--rule);
+            padding-bottom: 36px;
+            margin-bottom: 48px;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            align-items: end;
+            gap: 48px;
+            position: relative;
+        }
+
+        .masthead::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 48px;
+            height: 1px;
+            background: var(--accent);
+        }
+
+        .masthead-title {
+            font-family: var(--font-display);
+            font-size: clamp(44px, 6.5vw, 72px);
+            line-height: 0.95;
+            letter-spacing: -0.02em;
+            color: var(--paper);
+            margin: 0;
+            font-weight: 400;
+        }
+
+        .masthead-title em {
+            font-style: italic;
+            color: var(--accent);
+            font-weight: 400;
+        }
+
+        .masthead-kicker {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 400;
+            letter-spacing: 0.24em;
+            text-transform: uppercase;
+            color: var(--paper-faint);
+            margin: 0 0 18px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .masthead-kicker::after {
+            content: '';
+            flex: 0 0 auto;
+            width: 32px;
+            height: 1px;
+            background: var(--paper-ghost);
+        }
+
+        .masthead-meta {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--paper-faint);
+            text-align: right;
+            line-height: 2;
+            padding-bottom: 14px;
+        }
+
+        .masthead-meta .v { color: var(--paper-dim); }
+        .masthead-meta .sep { color: var(--paper-ghost); margin: 0 6px; }
+
+        /* ========== NAVIGATION / TABS ========== */
+        .tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 64px;
+            border-bottom: 1px solid var(--rule);
+            flex-wrap: wrap;
+        }
+
+        .tab {
+            background: none;
+            border: none;
+            padding: 0 28px 20px 0;
+            margin-right: 28px;
+            color: var(--paper-faint);
+            cursor: pointer;
+            font-family: var(--font-display);
+            font-size: 22px;
+            letter-spacing: -0.005em;
+            font-weight: 400;
+            font-style: italic;
+            position: relative;
+            transition: color 0.25s ease;
+            display: flex;
+            align-items: baseline;
+            gap: 14px;
+        }
+
+        .tab:last-child { margin-right: 0; }
+
+        .tab::before {
+            content: attr(data-num);
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-style: normal;
+            letter-spacing: 0.12em;
+            color: var(--paper-ghost);
+            transition: color 0.25s ease;
+            flex: 0 0 auto;
+        }
+
+        .tab:hover { color: var(--paper-dim); }
+        .tab:hover::before { color: var(--accent); }
+
+        .tab.active { color: var(--paper); }
+        .tab.active::before { color: var(--accent); }
+
+        .tab.active::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0;
+            right: 28px;
+            height: 1px;
+            background: var(--accent);
+        }
+
+        /* ========== PANELS ========== */
+        .panel {
+            display: none;
+            animation: fadeUp 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+        }
+
+        .panel.active { display: block; }
+
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Panel section header (the big italic intro) */
+        .panel-intro {
+            margin-bottom: 44px;
+            max-width: 68ch;
+        }
+
+        .panel-intro h3,
+        .panel > h3:first-of-type {
+            font-family: var(--font-display);
+            font-size: 44px;
+            font-weight: 400;
+            font-style: italic;
+            color: var(--paper);
+            margin: 0 0 14px;
+            letter-spacing: -0.015em;
+            line-height: 1.05;
+        }
+
+        .panel-intro p,
+        .panel > p:first-of-type {
+            color: var(--paper-dim);
+            font-size: 16px;
+            font-weight: 300;
+            line-height: 1.65;
+            margin: 0 0 40px;
+            max-width: 62ch;
+            font-family: var(--font-body);
+        }
+
+        /* Eyebrow / section divider for mid-panel sections */
+        .panel h3:not(:first-of-type) {
+            font-family: var(--font-display);
+            font-size: 28px;
+            font-style: italic;
+            font-weight: 400;
+            color: var(--paper);
+            margin: 56px 0 14px;
+            letter-spacing: -0.01em;
+        }
+
+        /* ========== SETTINGS GRID ========== */
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1px;
+            background: var(--rule-faint);
+            border: 1px solid var(--rule-faint);
+            margin-bottom: 32px;
+        }
+
+        .setting-card {
+            background: var(--ink);
+            padding: 32px 30px;
+            position: relative;
+            transition: background 0.2s ease;
+        }
+
+        .setting-card:hover { background: var(--ink-raised); }
+
+        .setting-card h3 {
+            font-family: var(--font-mono) !important;
+            font-size: 10px !important;
+            font-weight: 500 !important;
+            letter-spacing: 0.18em !important;
+            text-transform: uppercase !important;
+            color: var(--accent) !important;
+            margin: 0 0 8px !important;
+            font-style: normal !important;
+        }
+
+        .setting-card > p {
+            color: var(--paper-faint);
+            font-size: 13px;
+            margin: 0 0 20px;
+            line-height: 1.55;
+            font-family: var(--font-body);
+            max-width: none;
+        }
+
+        /* Standalone setting-cards (direct children of .panel, not inside a grid).
+           These get a raised surface treatment so they read as distinct sections. */
+        .panel > .setting-card {
+            background: var(--ink-raised);
+            padding: 36px 38px;
+            border: 1px solid var(--rule);
+            margin-bottom: 24px;
+            position: relative;
+        }
+
+        .panel > .setting-card::before {
+            content: '';
+            position: absolute;
+            top: -1px;
+            left: -1px;
+            width: 28px;
+            height: 2px;
+            background: var(--accent);
+        }
+
+        .panel > .setting-card:hover {
+            background: var(--ink-raised);
+        }
+
+        /* ========== TOGGLE BUTTON GROUPS ========== */
+        .toggle-group {
+            display: flex;
+            flex-wrap: wrap;
+            border: 1px solid var(--rule);
+            background: var(--ink-sunk);
+        }
+
+        .toggle-btn {
+            flex: 1 1 0;
+            min-width: 0;
+            background: transparent;
+            border: none;
+            padding: 11px 8px;
+            color: var(--paper-faint);
+            cursor: pointer;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 500;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            transition: all 0.2s ease;
+            border-right: 1px solid var(--rule);
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            overflow: hidden;
+        }
+
+        .toggle-btn:last-child { border-right: none; }
+
+        .toggle-btn:hover {
+            color: var(--paper);
+            background: var(--ink-hover);
+        }
+
+        .toggle-btn.active {
+            background: var(--paper);
+            color: var(--ink);
+        }
+
+        /* ========== SWITCHES (minimal marks) ========== */
+        .switch-container {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .switch {
+            position: relative;
+            width: 42px;
+            height: 22px;
+        }
+
+        .switch input { opacity: 0; width: 0; height: 0; }
+
+        .slider {
+            position: absolute;
+            inset: 0;
+            background: var(--ink-sunk);
+            border: 1px solid var(--rule);
+            cursor: pointer;
+            transition: all 0.25s ease;
+        }
+
+        .slider::before {
+            content: '';
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            left: 4px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: var(--paper-faint);
+            transition: all 0.25s ease;
+        }
+
+        input:checked + .slider {
+            border-color: var(--accent);
+            background: var(--ink-raised);
+        }
+
+        input:checked + .slider::before {
+            transform: translate(22px, -50%);
+            background: var(--accent);
+        }
+
+        .switch-container span {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 500;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--paper-dim);
+        }
+
+        /* ========== BUTTONS ========== */
+        .btn {
+            padding: 13px 28px;
+            background: var(--accent);
+            border: 1px solid var(--accent);
+            color: var(--paper);
+            cursor: pointer;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 500;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+        }
+
+        .btn:hover {
+            background: transparent;
+            color: var(--accent);
+        }
+
+        .btn:disabled {
+            background: var(--ink-raised);
+            border-color: var(--rule);
+            color: var(--paper-faint);
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: transparent;
+            border-color: var(--rule);
+            color: var(--paper-dim);
+        }
+
+        .btn-secondary:hover {
+            background: var(--paper);
+            border-color: var(--paper);
+            color: var(--ink);
+        }
+
+        /* ========== FORM INPUTS ========== */
+        .form-group { margin-bottom: 20px; }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-family: var(--font-mono);
+            font-size: 9px;
+            font-weight: 500;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--paper-faint);
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 12px 14px;
+            background: var(--ink-sunk);
+            border: 1px solid var(--rule);
+            color: var(--paper);
+            font-family: var(--font-body);
+            font-size: 14px;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            background: var(--ink-raised);
+        }
+
+        .form-group textarea {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.65;
+            min-height: 200px;
+            resize: vertical;
+        }
+
+        /* ========== RESULT BOX ========== */
+        .result-box {
+            margin-top: 24px;
+            background: var(--ink-sunk);
+            border: 1px solid var(--rule);
+            border-left: 2px solid var(--accent);
+            padding: 24px 28px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.7;
+            color: var(--paper);
+            white-space: pre-wrap;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        /* ========== STATUS BAR (byline-style) ========== */
+        .status-bar {
+            display: flex;
+            gap: 40px;
+            margin-top: 48px;
+            padding: 22px 0 0;
+            border-top: 1px solid var(--rule);
+            font-family: var(--font-mono);
+            font-size: 9px;
+            font-weight: 500;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--paper-faint);
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 12px rgba(138, 149, 65, 0.6);
+            animation: pulse 2.4s ease-in-out infinite;
+        }
+
+        .status-dot.warning {
+            background: var(--warn);
+            box-shadow: 0 0 12px rgba(201, 149, 69, 0.6);
+        }
+
+        .status-dot.error {
+            background: var(--error);
+            box-shadow: 0 0 12px rgba(162, 61, 42, 0.6);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.55; }
+        }
+
+        /* ========== LOADER ========== */
+        .loader {
+            display: none;
+            width: 12px;
+            height: 12px;
+            border: 1.5px solid var(--rule);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.75s linear infinite;
+            margin-left: 14px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .inline-flex {
+            display: flex;
+            align-items: center;
+        }
+
+        /* ========== SCROLLBAR ========== */
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: var(--ink); }
+        ::-webkit-scrollbar-thumb { background: var(--rule); }
+        ::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+
+        /* ========== TEXT SELECTION ========== */
+        ::selection {
+            background: var(--accent);
+            color: var(--paper);
+        }
+
+        /* ========== LINKS & STRONG ========== */
+        strong { color: var(--paper); font-weight: 600; }
+        small { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; }
+
+        /* ========== HORIZONTAL RULE ========== */
+        hr {
+            border: none;
+            height: 1px;
+            background: var(--rule);
+            margin: 56px 0;
+        }
+
+        /* ========== HELPER: ornament between sections ========== */
+        .ornament {
+            text-align: center;
+            color: var(--paper-ghost);
+            font-family: var(--font-display);
+            font-style: italic;
+            font-size: 18px;
+            margin: 40px 0;
+            letter-spacing: 0.4em;
+        }
+
+        /* ========== PROSE (used by Welcome panel) ========== */
+        .panel dl.prose-dl {
+            display: grid;
+            grid-template-columns: 180px 1fr;
+            gap: 20px 40px;
+            margin: 28px 0 40px;
+            max-width: 780px;
+        }
+
+        .panel dl.prose-dl dt {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 500;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--accent);
+            padding-top: 5px;
+            line-height: 1.4;
+        }
+
+        .panel dl.prose-dl dd {
+            margin: 0;
+            color: var(--paper-dim);
+            font-size: 15px;
+            line-height: 1.65;
+            font-family: var(--font-body);
+        }
+
+        .panel dl.prose-dl dd strong {
+            color: var(--paper);
+            font-weight: 500;
+        }
+
+        .panel blockquote.pull-quote {
+            font-family: var(--font-display);
+            font-style: italic;
+            font-size: clamp(22px, 2.4vw, 28px);
+            line-height: 1.3;
+            color: var(--paper);
+            border-left: 2px solid var(--accent);
+            padding: 6px 0 6px 28px;
+            margin: 44px 0;
+            max-width: 56ch;
+        }
+
+        .panel .prose p {
+            color: var(--paper-dim);
+            font-size: 15px;
+            line-height: 1.7;
+            max-width: 62ch;
+            margin: 0 0 20px;
+            font-family: var(--font-body);
+        }
+
+        .panel .prose p strong {
+            color: var(--paper);
+            font-weight: 500;
+        }
+
+        .panel code {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            background: var(--ink-sunk);
+            padding: 2px 7px;
+            color: var(--accent-soft);
+            border: 1px solid var(--rule);
+            letter-spacing: 0.02em;
+        }
+
+        .welcome-footer {
+            margin-top: 72px;
+            padding-top: 32px;
+            border-top: 1px solid var(--rule);
+            font-family: var(--font-mono);
+            font-size: 10px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--paper-ghost);
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+
+        /* ========== RESPONSIVE ========== */
+        @media (max-width: 720px) {
+            .container { padding: 48px 24px 64px; }
+            .masthead { grid-template-columns: 1fr; gap: 20px; }
+            .masthead-meta { text-align: left; }
+            .tabs { gap: 0; }
+            .tab { font-size: 18px; margin-right: 20px; padding-right: 20px; }
+            .panel > h3:first-of-type { font-size: 32px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="masthead">
+            <div>
+                <p class="masthead-kicker">A Bridge for Collaborative Fiction</p>
+                <h1 class="masthead-title">Claude Code<br><em>↔</em> SillyTavern Bridge</h1>
+            </div>
+            <div class="masthead-meta">
+                <div><span class="v">Vol. I</span><span class="sep">·</span>Issue 042</div>
+                <div>Subprocess <span class="sep">·</span> OpenAI-Compatible</div>
+                <div>Localhost <span class="sep">:</span>5001</div>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab active" data-num="I" onclick="showTab('welcome')">Welcome</button>
+            <button class="tab" data-num="II" onclick="showTab('settings')">Settings</button>
+            <button class="tab" data-num="III" onclick="showTab('system')">System Prompt</button>
+            <button class="tab" data-num="IV" onclick="showTab('tools')">Tools</button>
+            <button class="tab" data-num="V" onclick="showTab('lorebook')">Lorebook</button>
+            <button class="tab" data-num="VI" onclick="showTab('test')">Test</button>
+        </nav>
+
+        <!-- Welcome Panel -->
+        <div id="welcome" class="panel active">
+            <h3>A field guide to the bridge.</h3>
+            <div class="prose">
+                <p>
+                    A subprocess bridge between <strong>SillyTavern</strong> and <strong>Claude Code CLI</strong>. SillyTavern sends OpenAI-compatible requests to this server; the bridge translates them, injects narrative-focused system prompts, pipes the result through <code>claude -p</code>, and returns the response. Everything in this interface controls how that translation works.
+                </p>
+            </div>
+
+            <blockquote class="pull-quote">
+                One endpoint. Six tabs. Per-character memory, editable prompts, and whatever you add next.
+            </blockquote>
+
+            <h3>Getting Started</h3>
+            <dl class="prose-dl">
+                <dt>Endpoint</dt>
+                <dd>Point SillyTavern's OpenAI-compatible API at <code>http://localhost:5001/v1</code>. Any API key string works — the bridge doesn't check.</dd>
+
+                <dt>Model</dt>
+                <dd>SillyTavern's model selector is ignored. Choose Opus or Sonnet in the Settings tab instead.</dd>
+
+                <dt>Start command</dt>
+                <dd>Run <code>run_bridge.bat</code> (or <code>python claude_bridge.py</code>) and keep the terminal visible — structured logs appear there while the bridge is running.</dd>
+
+                <dt>Changing the port</dt>
+                <dd>The bridge binds <code>:5001</code> by default. Change it in the Settings tab — the value persists to <code>bridge_settings.json</code>, but you'll need to restart the bridge for the new port to take effect (the GUI shows a <em>Restart bridge</em> reminder when there's a pending change).</dd>
+            </dl>
+
+            <h3>The Six Tabs</h3>
+            <dl class="prose-dl">
+                <dt>I · Welcome</dt>
+                <dd>This page. Documentation, orientation, reference.</dd>
+
+                <dt>II · Settings</dt>
+                <dd>Model selection, effort level, creativity mode (a prompt-based stand-in for temperature, since Claude Code CLI doesn't expose the real parameter), and toggles for thinking visibility, debug logging, and tool calling.</dd>
+
+                <dt>III · System Prompt</dt>
+                <dd>The bridge injects a "narrative writer, not coding assistant" preamble before every request. Override it here if you want different framing. Leave empty to use the default — the default is fetched from the backend, so there's only one source of truth.</dd>
+
+                <dt>IV · Tools</dt>
+                <dd><strong>Auto-Summary</strong> (the important one): maintains a running narrative digest per character. Cuts per-request usage massively on long RPs — instead of re-sending 200 raw messages every turn, you send <em>summary + last 15</em>. One summarization call pays back over dozens of subsequent turns, and prompt caching makes the stable parts near-free. <strong>Chunking</strong>: one-shot manual reset that rebuilds a character's summary from scratch. <strong>Summary Cache</strong>: inspector for every stored summary, one row per character, with per-entry delete.</dd>
+
+                <dt>V · Lorebook</dt>
+                <dd>Auto-generates World Info entries in the background after each RP message, using Sonnet for efficiency. Deep Analysis scans a full chat file for a more thorough pass. Manual Entry lets you add lore by hand.</dd>
+
+                <dt>VI · Test</dt>
+                <dd>Send a message directly at the bridge without going through SillyTavern. Useful when debugging or checking that a new system prompt is wired up correctly.</dd>
+            </dl>
+
+            <h3>Per-Character Summaries</h3>
+            <div class="prose">
+                <p>
+                    Every character gets its own summary bucket. The bridge identifies a character by hashing the first assistant message (the character's greeting) and stores summaries under <code>auto_&lt;hash&gt;</code> cache keys. Switching characters in SillyTavern auto-swaps buckets — no manual cache clearing, and two characters can't cross-contaminate each other's narrative.
+                </p>
+                <p>
+                    If you edit a character's greeting mid-chat, the hash changes and a new bucket appears. Rare, but worth knowing. Legacy pre-per-character entries (those with the bare <code>auto</code> key) auto-migrate to the current character on the next auto-summary update — you'll see a ⚠ flag in the Summary Cache panel while they exist.
+                </p>
+            </div>
+
+            <h3>Editing Prompts</h3>
+            <div class="prose">
+                <p>
+                    The bridge's internal prompts — summarization, condensation, chunk processing — live as editable Markdown files in the <code>prompts/</code> directory next to <code>claude_bridge.py</code>:
+                </p>
+            </div>
+            <dl class="prose-dl">
+                <dt>summarize_incremental</dt>
+                <dd>Runs each time the auto-summary threshold is hit. Takes new messages, returns a narrative chunk that gets appended to the existing summary.</dd>
+
+                <dt>condense</dt>
+                <dd>Fires when a summary grows past <code>auto_summary_max_length</code> characters. Narrative-preserving condensation targeting ~60% of the original length.</dd>
+
+                <dt>summarize_chunk</dt>
+                <dd>Used by both chunking paths (the live <code>/v1/chat/completions</code> chunking mode and the <code>/api/summary/generate</code> file-based mode) for individual chunk summaries.</dd>
+
+                <dt>condense_chronological</dt>
+                <dd>Final pass in the file-based summary generator when combined chunks exceed 50K characters. Organizes events chronologically across the whole chat.</dd>
+            </dl>
+            <div class="prose">
+                <p>
+                    Templates use Python <code>&#123;variable&#125;</code> placeholders. Edits apply on the next request — no server restart needed, because <code>load_prompt()</code> re-reads the file every call. If you need a literal brace in a prompt (rare), double it: <code>&#123;&#123;</code> and <code>&#125;&#125;</code>.
+                </p>
+                <p>
+                    The main RP system prompt is <em>not</em> in this folder — it's the <code>DEFAULT_BRIDGE_SYSTEM_PROMPT</code> constant in <code>claude_bridge.py</code>, editable via the System Prompt tab.
+                </p>
+            </div>
+
+            <h3>Tips &amp; Gotchas</h3>
+            <dl class="prose-dl">
+                <dt>Images</dt>
+                <dd>SillyTavern sends base64 images. The bridge saves them to <code>temp_images/</code> and injects a file path so Claude Code can <code>Read</code> them directly — no OCR step, no subprocess refusals.</dd>
+
+                <dt>Tool calling</dt>
+                <dd>Extensions like TunnelVision route through the tool-calling toggle. Disable it if you're getting strange outputs or the extension is in an odd state.</dd>
+
+                <dt>Streaming</dt>
+                <dd>Currently buffered. The bridge waits for Claude's full response before returning to SillyTavern, even when ST requests streaming. Known limitation — on the list.</dd>
+
+                <dt>Chunking</dt>
+                <dd>One-shot by design: enable it, send one message, the bridge splits the conversation, summarizes every chunk, seeds the character's auto-summary bucket, and auto-disables. Use it after importing a long chat, not for every turn. The Cancel button disarms it without sending a request.</dd>
+
+                <dt>Character key</dt>
+                <dd>The hash is 16 characters of MD5 over the first 2000 chars of the greeting. Stable across turns. If you use the backup zip to restore state, cache keys remain valid.</dd>
+
+                <dt>Debug logs</dt>
+                <dd>Enable Debug Output in Settings to see every incoming request structure, image detection passes, and prompt sizes in the bridge terminal. Essential when wiring up new SillyTavern extensions.</dd>
+            </dl>
+
+            <div class="welcome-footer">
+                <span>Bridge for collaborative fiction</span>
+                <span>Localhost · Flask · Claude Code CLI</span>
+            </div>
+        </div>
+
+        <!-- Settings Panel -->
+        <div id="settings" class="panel">
+            <div class="settings-grid">
+                <div class="setting-card">
+                    <h3>Model</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Opus = most capable, Sonnet = faster</p>
+                    <div class="toggle-group">
+                        <button class="toggle-btn active" data-setting="model" data-value="opus">Opus</button>
+                        <button class="toggle-btn" data-setting="model" data-value="sonnet">Sonnet</button>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Effort Level</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Higher = more thinking/reasoning</p>
+                    <div class="toggle-group">
+                        <button class="toggle-btn" data-setting="effort" data-value="low">Low</button>
+                        <button class="toggle-btn" data-setting="effort" data-value="medium">Medium</button>
+                        <button class="toggle-btn active" data-setting="effort" data-value="high">High</button>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Creativity</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Simulates temperature - controls writing style variation</p>
+                    <div class="toggle-group">
+                        <button class="toggle-btn" data-setting="creativity" data-value="precise">Precise</button>
+                        <button class="toggle-btn active" data-setting="creativity" data-value="balanced">Balanced</button>
+                        <button class="toggle-btn" data-setting="creativity" data-value="creative">Creative</button>
+                        <button class="toggle-btn" data-setting="creativity" data-value="wild">Wild</button>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Include Thinking in Response</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Send &lt;think&gt; tags to SillyTavern</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="includeThinking" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span id="thinkingStatus">Enabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Show Thinking in Console</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Display thinking in bridge terminal</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="consoleThinking" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span id="consoleStatus">Enabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Debug Output</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Verbose logging in console</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="debugOutput" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span id="debugStatus">Enabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Tool Calling</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Support for extensions like TunnelVision</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="toolCalling" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span id="toolCallingStatus">Enabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Bridge Port</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">HTTP server port. Restart required to apply.</p>
+                    <input type="number" id="bridgePort" min="1" max="65535" step="1" value="5001" style="width:120px;padding:10px 12px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:13px;">
+                    <span id="bridgePortNotice" style="display:none;margin-left:10px;font-family:var(--font-mono);font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:var(--warn);">Restart bridge</span>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Simulated Streaming</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Claude Code doesn't emit token deltas — the bridge paces the completed response through SSE so ST renders it progressively.</p>
+                    <div class="toggle-group">
+                        <button class="toggle-btn" data-setting="sim-stream" data-value="off">Off</button>
+                        <button class="toggle-btn" data-setting="sim-stream" data-value="slow">Slow</button>
+                        <button class="toggle-btn active" data-setting="sim-stream" data-value="natural">Natural</button>
+                        <button class="toggle-btn" data-setting="sim-stream" data-value="fast">Fast</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="status-bar">
+                <div class="status-item">
+                    <div class="status-dot" id="connectionDot"></div>
+                    <span>Bridge Active</span>
+                </div>
+                <div class="status-item">
+                    <span style="color:var(--paper-faint);">Endpoint:</span>
+                    <span id="endpointDisplay">http://localhost:5001/v1</span>
+                </div>
+            </div>
+
+            <button class="btn" style="margin-top:20px;" onclick="saveSettings()">Save Settings</button>
+            <span id="saveStatus" style="margin-left:15px;color:var(--success);display:none;">Settings saved!</span>
+        </div>
+
+        <!-- System Prompt Panel -->
+        <div id="system" class="panel">
+            <h3>Bridge System Prompt</h3>
+            <p>
+                The system prompt injected by the bridge to override Claude Code's default coding assistant behavior.
+                Edit to customize how Claude behaves during roleplay. Leave empty for the default.
+            </p>
+
+            <div class="setting-card" style="max-width:100%;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h3 style="margin:0;">System Prompt Override</h3>
+                    <button class="btn" onclick="resetSystemPrompt()" style="padding:5px 10px;font-size:12px;">Reset to Default</button>
+                </div>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    This replaces Claude Code's default system prompt. The character card's system prompt from SillyTavern is separate and still applies.
+                </p>
+                <textarea id="systemPromptEditor" style="width:100%;height:460px;background:var(--ink-sunk);color:var(--paper);border:1px solid var(--rule);padding:20px;font-family:var(--font-mono);font-size:12.5px;line-height:1.7;resize:vertical;"></textarea>
+                <div style="margin-top:15px;display:flex;gap:10px;align-items:center;">
+                    <button class="btn" onclick="saveSystemPrompt()">Save System Prompt</button>
+                    <span id="systemPromptStatus" style="color:var(--success);display:none;">Saved!</span>
+                </div>
+            </div>
+
+            <div class="setting-card" style="max-width:100%;margin-top:20px;">
+                <h3>How This Works</h3>
+                <ul style="color:var(--paper-dim);font-size:13px;line-height:1.8;">
+                    <li><strong>Bridge System Prompt (above)</strong>: Tells Claude "you are a roleplay writer, not a coding assistant"</li>
+                    <li><strong>SillyTavern System Prompt</strong>: Your character card, scenario, etc. (sent separately)</li>
+                    <li>Both work together - the bridge prompt sets the "mode", SillyTavern provides the content</li>
+                    <li>If you leave the above empty, a sensible default is used</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Tools Panel -->
+        <div id="tools" class="panel">
+            <h3>Auto-Summary</h3>
+            <p>
+                <strong>Cuts per-request token usage dramatically on long RPs.</strong> Without it, SillyTavern re-sends your entire message history every turn — at message 200, that's the whole conversation going up the pipe on every single reply. Auto-summary replaces old messages with a condensed narrative digest the bridge keeps per character, so each request sends <em>summary + last 15 messages</em> instead of the full backlog. The one-time cost of generating the summary is paid back many times over the next dozens of turns, and because the summary + system prompt stay stable across requests, Claude's prompt cache kicks in and most of those tokens come back as cheap cache reads instead of full reads. New events get appended without losing old ones, and each character's story lives in its own bucket — switching characters won't cross-contaminate context.
+            </p>
+
+            <div class="setting-card" style="max-width:500px;">
+                <h3>Toggle</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    When enabled, summarizes new messages incrementally and appends to that character's existing summary.
+                </p>
+                <div class="switch-container" style="margin-bottom:15px;">
+                    <label class="switch">
+                        <input type="checkbox" id="autoSummary">
+                        <span class="slider"></span>
+                    </label>
+                    <span id="autoSummaryStatus">Disabled</span>
+                </div>
+
+                <div id="autoSummarySettings" style="display:none;">
+                    <div class="form-group" style="margin-bottom:10px;">
+                        <label style="font-size:12px;">Update after X new messages:</label>
+                        <input type="number" id="autoSummaryThreshold" value="20" min="5" max="100" style="width:80px;">
+                    </div>
+                    <div class="form-group" style="margin-bottom:10px;">
+                        <label style="font-size:12px;">Condense summary when exceeds (chars):</label>
+                        <input type="number" id="autoSummaryMaxLength" value="50000" min="10000" max="200000" style="width:100px;">
+                    </div>
+                    <button class="btn btn-secondary" style="font-size:12px;padding:6px 12px;" onclick="saveAutoSummarySettings()">
+                        Save Thresholds
+                    </button>
+                </div>
+
+                <p id="autoSummaryInfo" style="color:var(--paper-faint);font-size:12px;margin-top:10px;">
+                    Loading status...
+                </p>
+            </div>
+
+            <hr style="border-color:var(--rule);margin:30px 0;">
+
+            <h3>Generate from Chat File</h3>
+            <p>
+                Create a summary directly from a SillyTavern chat file. More accurate than relying on what ST sends.
+            </p>
+
+            <div class="setting-card" style="max-width:600px;margin-bottom:20px;">
+                <h3>Chat File</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    Select a chat file to generate a comprehensive summary. Supports chunking for long conversations.
+                </p>
+
+                <div class="form-group" style="margin-bottom:10px;">
+                    <label style="font-size:12px;">Chat File:</label>
+                    <select id="summaryFileSelect" style="margin-bottom:8px;" onchange="updateSummaryFilePath()">
+                        <option value="">-- Select a chat file --</option>
+                    </select>
+                    <input type="text" id="summaryFilePath" placeholder="Or paste full path to .jsonl chat file" style="font-size:12px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom:15px;">
+                    <label style="font-size:12px;">Model:</label>
+                    <div class="toggle-group" style="margin-top:5px;">
+                        <button class="toggle-btn active" data-setting="summary-model" data-value="sonnet">Sonnet (Fast)</button>
+                        <button class="toggle-btn" data-setting="summary-model" data-value="opus">Opus (Thorough)</button>
+                    </div>
+                </div>
+
+                <button class="btn" onclick="generateSummaryFromFile()" id="genSummaryBtn">
+                    Generate Summary
+                </button>
+            </div>
+
+            <hr style="border-color:var(--rule);margin:30px 0;">
+
+            <h3>Manual Chunking</h3>
+            <p>
+                Manually trigger a full conversation summary. Useful for initial setup or reset.
+            </p>
+
+            <div class="setting-card" style="max-width:400px;">
+                <h3>One-Shot Chunking</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    When enabled, the next request will be split into chunks,<br>
+                    summarized, and combined. Auto-disables after use.
+                </p>
+                <button class="btn" id="chunkingBtn" onclick="toggleChunking()">
+                    Enable Chunking
+                </button>
+                <button class="btn btn-secondary" id="chunkingCancelBtn" onclick="disableChunking()" style="display:none;margin-left:8px;">
+                    Cancel
+                </button>
+                <p id="chunkingStatus" style="color:var(--paper-faint);font-size:12px;margin-top:10px;">
+                    Status: Disabled
+                </p>
+            </div>
+
+            <div class="setting-card" style="max-width:800px;margin-top:20px;">
+                <h3>Summary Cache</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    Each character gets its own summary bucket — switching characters in SillyTavern auto-swaps entries, no manual cache clearing needed.
+                    The bridge identifies a character by hashing its greeting (first assistant message).
+                </p>
+                <div id="cacheInfo" style="color:var(--paper-dim);font-size:13px;margin-bottom:15px;">
+                    Loading cache info...
+                </div>
+                <div id="cacheEntries" style="margin-bottom:15px;"></div>
+                <button class="btn btn-secondary" onclick="refreshCache()" style="margin-right:10px;">
+                    Refresh
+                </button>
+                <button class="btn btn-secondary" onclick="clearCache()">
+                    Clear All
+                </button>
+            </div>
+
+            <div class="tool-section" style="margin-top:30px;">
+                <h3>How It Works</h3>
+                <div style="background:var(--ink-sunk);padding:20px;">
+                    <ol style="color:var(--paper-dim);margin:0;padding-left:20px;">
+                        <li style="margin-bottom:10px;">Click <strong style="color:var(--accent);">"Enable Chunking"</strong> above</li>
+                        <li style="margin-bottom:10px;">Go to SillyTavern and send any message</li>
+                        <li style="margin-bottom:10px;">The conversation is split into ~80K token chunks</li>
+                        <li style="margin-bottom:10px;">Each chunk is summarized (cached for reuse)</li>
+                        <li style="margin-bottom:10px;">Summaries are combined into context</li>
+                        <li>Your request is sent with the summary context</li>
+                    </ol>
+                </div>
+            </div>
+        </div>
+
+        <!-- Lorebook Panel -->
+        <div id="lorebook" class="panel">
+            <h3>Auto-Lorebook</h3>
+            <p>
+                Automatically generates World Info entries from your roleplay. Runs in the <strong>background</strong> after you send a new message (meaning you accepted the previous response). Uses a separate Claude call with Sonnet for efficiency — zero impact on your RP response time.
+            </p>
+
+            <div class="settings-grid" style="margin-bottom:20px;">
+                <div class="setting-card">
+                    <h3>Toggle</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                        When enabled, Claude will automatically add lore entries for significant new information.
+                    </p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="lorebookEnabled">
+                            <span class="slider"></span>
+                        </label>
+                        <span id="lorebookStatus">Disabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>SillyTavern Path</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Path to SillyTavern worlds folder</p>
+                    <input type="text" id="lorebookPath" style="font-size:12px;margin-bottom:10px;"
+                        placeholder="e.g. D:\Sillytavern\SillyTavern\data\default-user\worlds">
+                    <div class="form-group" style="margin-bottom:10px;">
+                        <label style="font-size:12px;">Lorebook filename:</label>
+                        <input type="text" id="lorebookName" value="claude_auto_lore.json" style="font-size:12px;">
+                    </div>
+                    <button class="btn btn-secondary" style="font-size:12px;padding:6px 12px;" onclick="saveLorebookSettings()">
+                        Save Path
+                    </button>
+                </div>
+            </div>
+
+            <div id="lorebookStatusBox" style="background:var(--ink-sunk);padding:15px;margin-bottom:20px;">
+                <div style="display:flex;align-items:center;gap:10px;justify-content:space-between;">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span id="lorebookDot" class="status-dot" style="background:var(--paper-faint);"></span>
+                        <span id="lorebookPathStatus">Loading...</span>
+                    </div>
+                </div>
+                <p style="color:var(--paper-ghost);font-size:11px;margin-top:10px;margin-bottom:0;">
+                    Auto: Runs every 4 messages using Sonnet (recent only). <strong>Deep Analysis</strong>: Full conversation with chunking support for long RPs, uses Opus, can update existing entries.
+                </p>
+            </div>
+
+            <div class="setting-card" style="margin-bottom:20px;">
+                <h3>Deep Analysis</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    Analyze a full conversation for lore. Can read directly from SillyTavern chat files.
+                </p>
+
+                <div class="form-group" style="margin-bottom:10px;">
+                    <label style="font-size:12px;">Chat File (select or paste path):</label>
+                    <select id="chatFileSelect" style="margin-bottom:8px;" onchange="updateChatFilePath()">
+                        <option value="">-- Select a chat file --</option>
+                    </select>
+                    <input type="text" id="chatFilePath" placeholder="Or paste full path to .jsonl chat file" style="font-size:12px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom:15px;">
+                    <label style="font-size:12px;">Model for analysis:</label>
+                    <div class="toggle-group" style="margin-top:5px;">
+                        <button class="toggle-btn active" data-setting="deep-model" data-value="sonnet">Sonnet (Fast)</button>
+                        <button class="toggle-btn" data-setting="deep-model" data-value="opus">Opus (Thorough)</button>
+                    </div>
+                </div>
+
+                <button class="btn" onclick="triggerQuickAnalysis()" style="margin-right:10px;">
+                    Quick Analyze Now
+                </button>
+                <button class="btn" onclick="triggerDeepAnalysis()" id="deepAnalyzeBtn" style="margin-right:10px;">
+                    Run Deep Analysis
+                </button>
+                <button class="btn btn-secondary" onclick="loadChatFiles()" style="padding:8px 12px;">
+                    Refresh Chats
+                </button>
+            </div>
+
+            <div class="setting-card" style="margin-bottom:20px;">
+                <h3>Manual Entry</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">Add a lorebook entry manually</p>
+
+                <div class="form-group" style="margin-bottom:10px;">
+                    <label style="font-size:12px;">Keywords (comma-separated):</label>
+                    <input type="text" id="entryKeywords" placeholder="Morgan, Morgan Henderson">
+                </div>
+                <div class="form-group" style="margin-bottom:10px;">
+                    <label style="font-size:12px;">Entry Name:</label>
+                    <input type="text" id="entryName" placeholder="Morgan Henderson">
+                </div>
+                <div class="form-group" style="margin-bottom:10px;">
+                    <label style="font-size:12px;">Position:</label>
+                    <select id="entryPosition" style="padding:8px;">
+                        <option value="0">Before Character Definition</option>
+                        <option value="1">After Character Definition</option>
+                        <option value="4">At Depth</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-bottom:10px;">
+                    <label style="font-size:12px;">Content:</label>
+                    <textarea id="entryContent" style="min-height:100px;" placeholder="Detailed lore content..."></textarea>
+                </div>
+                <button class="btn" onclick="addLorebookEntry()">Add Entry</button>
+            </div>
+
+            <div class="setting-card">
+                <h3>Current Entries</h3>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    Entries in your auto-lorebook (click to expand)
+                </p>
+                <div id="lorebookEntries" style="margin-bottom:15px;">
+                    Loading entries...
+                </div>
+                <button class="btn btn-secondary" onclick="refreshLorebook()" style="margin-right:10px;">
+                    Refresh
+                </button>
+                <button class="btn btn-secondary" onclick="clearLorebook()" style="background:var(--accent-dim);">
+                    Clear All
+                </button>
+            </div>
+        </div>
+
+
+        <!-- Test Panel -->
+        <div id="test" class="panel">
+            <h3>Test Message</h3>
+            <p>Send a test message to verify the bridge is working.</p>
+
+            <div class="setting-card" style="max-width:720px;">
+                <div class="form-group">
+                    <label>System Prompt (optional)</label>
+                    <textarea id="testSystem" style="min-height:80px;" placeholder="You are a helpful assistant..."></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>User Message</label>
+                    <textarea id="testMessage" style="min-height:80px;" placeholder="Hello, how are you?"></textarea>
+                </div>
+
+                <div class="inline-flex">
+                    <button class="btn" onclick="sendTestMessage()">Send Test</button>
+                    <div class="loader" id="testLoader"></div>
+                </div>
+
+                <div class="result-box" id="testResult" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Tab switching
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.querySelector(`[onclick="showTab('${tabName}')"]`).classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+
+            // Auto-refresh when switching tabs
+            if (tabName === 'tools') {
+                refreshCache();
+            } else if (tabName === 'lorebook') {
+                refreshLorebook();
+            }
+        }
+
+        // Toggle buttons (auto-save on click)
+        document.querySelectorAll('.toggle-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const setting = btn.dataset.setting;
+                document.querySelectorAll(`[data-setting="${setting}"]`).forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                saveSettings(); // Auto-save when toggled
+            });
+        });
+
+        // Switch toggles (auto-save on change)
+        document.getElementById('includeThinking').addEventListener('change', function() {
+            document.getElementById('thinkingStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
+        document.getElementById('consoleThinking').addEventListener('change', function() {
+            document.getElementById('consoleStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
+        document.getElementById('debugOutput').addEventListener('change', function() {
+            document.getElementById('debugStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
+        document.getElementById('toolCalling').addEventListener('change', function() {
+            document.getElementById('toolCallingStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
+        document.getElementById('autoSummary').addEventListener('change', function() {
+            const enabled = this.checked;
+            document.getElementById('autoSummaryStatus').textContent = enabled ? 'Enabled' : 'Disabled';
+            document.getElementById('autoSummarySettings').style.display = enabled ? 'block' : 'none';
+            saveAutoSummarySettings();
+        });
+
+        // Port change: flag unsaved differences from the running port, and
+        // debounce-save so each digit doesn't fire its own request.
+        let portSaveTimer = null;
+        document.getElementById('bridgePort').addEventListener('input', function() {
+            updatePortNotice();
+            clearTimeout(portSaveTimer);
+            portSaveTimer = setTimeout(saveSettings, 500);
+        });
+
+        function updatePortNotice() {
+            const current = parseInt(document.getElementById('bridgePort').value, 10);
+            const notice = document.getElementById('bridgePortNotice');
+            if (RUNNING_PORT !== null && current && current !== RUNNING_PORT) {
+                notice.style.display = 'inline';
+            } else {
+                notice.style.display = 'none';
+            }
+        }
+
+        // Default system prompt is fetched from the backend on load so the GUI
+        // can never drift from the real default baked into claude_bridge.py.
+        let DEFAULT_SYSTEM_PROMPT = '';
+        async function loadDefaultSystemPrompt() {
+            try {
+                const response = await fetch('/api/settings/default_system_prompt');
+                const data = await response.json();
+                DEFAULT_SYSTEM_PROMPT = data.default_system_prompt || '';
+            } catch (e) {
+                console.error('Failed to load default system prompt:', e);
+            }
+        }
+
+        // Track which port the bridge actually started on, so we can flag
+        // unsaved port changes that need a restart.
+        let RUNNING_PORT = null;
+
+        // Save settings
+        async function saveSettings() {
+            const settings = {
+                model: document.querySelector('[data-setting="model"].active').dataset.value,
+                effort_level: document.querySelector('[data-setting="effort"].active').dataset.value,
+                creativity: document.querySelector('[data-setting="creativity"].active')?.dataset.value || 'balanced',
+                include_thinking: document.getElementById('includeThinking').checked,
+                show_thinking_console: document.getElementById('consoleThinking').checked,
+                debug_output: document.getElementById('debugOutput').checked,
+                tool_calling_enabled: document.getElementById('toolCalling').checked,
+                bridge_port: parseInt(document.getElementById('bridgePort').value, 10) || 5001,
+                simulated_streaming: document.querySelector('[data-setting="sim-stream"].active')?.dataset.value || 'natural'
+            };
+
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+
+                if (response.ok) {
+                    const status = document.getElementById('saveStatus');
+                    status.style.display = 'inline';
+                    setTimeout(() => status.style.display = 'none', 2000);
+                }
+            } catch (e) {
+                alert('Error saving settings: ' + e.message);
+            }
+        }
+
+        // Load settings on page load
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings');
+                const settings = await response.json();
+
+                // Apply settings to UI
+                document.querySelectorAll('[data-setting="model"]').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.value === settings.model);
+                });
+                document.querySelectorAll('[data-setting="effort"]').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.value === settings.effort_level);
+                });
+                document.querySelectorAll('[data-setting="creativity"]').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.value === (settings.creativity || 'balanced'));
+                });
+                document.querySelectorAll('[data-setting="sim-stream"]').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.value === (settings.simulated_streaming || 'natural'));
+                });
+                document.getElementById('includeThinking').checked = settings.include_thinking;
+                document.getElementById('consoleThinking').checked = settings.show_thinking_console;
+                document.getElementById('debugOutput').checked = settings.debug_output;
+
+                // Update status text
+                document.getElementById('thinkingStatus').textContent = settings.include_thinking ? 'Enabled' : 'Disabled';
+                document.getElementById('consoleStatus').textContent = settings.show_thinking_console ? 'Enabled' : 'Disabled';
+                document.getElementById('debugStatus').textContent = settings.debug_output ? 'Enabled' : 'Disabled';
+
+                // Tool calling
+                const toolCallingEnabled = settings.tool_calling_enabled !== false; // default true
+                document.getElementById('toolCalling').checked = toolCallingEnabled;
+                document.getElementById('toolCallingStatus').textContent = toolCallingEnabled ? 'Enabled' : 'Disabled';
+
+                // Bridge port — the first time we load, whatever comes back from
+                // the server IS the running port (since we're hitting the server
+                // right now). Save it so we can later detect unsaved changes.
+                const savedPort = settings.bridge_port || 5001;
+                document.getElementById('bridgePort').value = savedPort;
+                if (RUNNING_PORT === null) RUNNING_PORT = savedPort;
+                updatePortNotice();
+                document.getElementById('endpointDisplay').textContent = `http://localhost:${RUNNING_PORT}/v1`;
+
+                // Auto-summary settings
+                const autoSummaryEnabled = settings.auto_summary_enabled || false;
+                document.getElementById('autoSummary').checked = autoSummaryEnabled;
+                document.getElementById('autoSummaryStatus').textContent = autoSummaryEnabled ? 'Enabled' : 'Disabled';
+                document.getElementById('autoSummarySettings').style.display = autoSummaryEnabled ? 'block' : 'none';
+                document.getElementById('autoSummaryThreshold').value = settings.auto_summary_threshold || 20;
+                document.getElementById('autoSummaryMaxLength').value = settings.auto_summary_max_length || 50000;
+                updateAutoSummaryInfo();
+
+                // Chunking state
+                if (typeof updateChunkingUI === 'function') {
+                    updateChunkingUI(settings.chunking_enabled || false);
+                }
+
+                // Lorebook settings
+                document.getElementById('lorebookEnabled').checked = settings.lorebook_enabled || false;
+                document.getElementById('lorebookStatus').textContent = settings.lorebook_enabled ? 'Enabled' : 'Disabled';
+                if (settings.lorebook_path) {
+                    document.getElementById('lorebookPath').value = settings.lorebook_path;
+                }
+                if (settings.lorebook_name) {
+                    document.getElementById('lorebookName').value = settings.lorebook_name;
+                }
+
+                // System prompt override - show default if empty
+                document.getElementById('systemPromptEditor').value = settings.system_prompt_override || DEFAULT_SYSTEM_PROMPT;
+            } catch (e) {
+                console.error('Error loading settings:', e);
+            }
+        }
+
+        // Save auto-summary settings
+        async function saveAutoSummarySettings() {
+            const settings = {
+                auto_summary_enabled: document.getElementById('autoSummary').checked,
+                auto_summary_threshold: parseInt(document.getElementById('autoSummaryThreshold').value) || 20,
+                auto_summary_max_length: parseInt(document.getElementById('autoSummaryMaxLength').value) || 50000
+            };
+
+            try {
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+                updateAutoSummaryInfo();
+            } catch (e) {
+                console.error('Error saving auto-summary settings:', e);
+            }
+        }
+
+        // System prompt functions
+        async function saveSystemPrompt() {
+            const prompt = document.getElementById('systemPromptEditor').value;
+            const status = document.getElementById('systemPromptStatus');
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ system_prompt_override: prompt })
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                status.textContent = 'Saved!';
+                status.style.color = 'var(--success)';
+                status.style.display = 'inline';
+                setTimeout(() => { status.style.display = 'none'; }, 2000);
+            } catch (e) {
+                console.error('Error saving system prompt:', e);
+                status.textContent = 'Save failed: ' + e.message;
+                status.style.color = 'var(--error)';
+                status.style.display = 'inline';
+            }
+        }
+
+        async function resetSystemPrompt() {
+            if (!confirm('Reset to default system prompt? This will save immediately.')) return;
+            // Ensure we have the default (in case it failed to load earlier)
+            if (!DEFAULT_SYSTEM_PROMPT) {
+                await loadDefaultSystemPrompt();
+            }
+            document.getElementById('systemPromptEditor').value = DEFAULT_SYSTEM_PROMPT;
+            // Persist the reset so it doesn't evaporate on reload
+            await saveSystemPrompt();
+        }
+
+        // Update auto-summary status info
+        async function updateAutoSummaryInfo() {
+            try {
+                const response = await fetch('/api/cache');
+                const data = await response.json();
+                const info = document.getElementById('autoSummaryInfo');
+
+                // Entries are now per-character: keys of the form 'auto_<char_key>'.
+                // Legacy 'auto' and 'latest' keys are still handled for backward compat.
+                const charEntries = data.entries.filter(e => e.key && e.key.startsWith('auto_'));
+                const legacyAuto = data.entries.find(e => e.key === 'auto');
+                const legacyLatest = data.entries.find(e => e.key === 'latest');
+
+                if (charEntries.length === 0 && !legacyAuto && !legacyLatest) {
+                    info.innerHTML = `<span style="color:var(--paper-faint);">●</span> No summaries yet (will create after threshold on each character)`;
+                    return;
+                }
+
+                let html = '';
+                if (charEntries.length > 0) {
+                    const totalChars = charEntries.reduce((s, e) => s + e.length, 0).toLocaleString();
+                    html += `<span style="color:var(--success);">●</span> <strong>${charEntries.length}</strong> character summar${charEntries.length === 1 ? 'y' : 'ies'} active <span style="color:var(--paper-ghost);">(${totalChars} chars total)</span>`;
+
+                    // Show the most recently updated one as the active one
+                    const mostRecent = [...charEntries].sort((a, b) =>
+                        new Date(b.timestamp) - new Date(a.timestamp)
+                    )[0];
+                    if (mostRecent) {
+                        const date = new Date(mostRecent.timestamp).toLocaleString();
+                        const firstLine = (mostRecent.preview || '').split('\n')[0].slice(0, 80);
+                        html += `<br><small style="color:var(--paper-faint);">Latest: ${escapeHtml(firstLine)}... <span style="color:var(--paper-ghost);">(${date})</span></small>`;
+                    }
+                }
+                if (legacyAuto) {
+                    html += `<br><small style="color:var(--warn);">⚠️ Legacy 'auto' entry found — will migrate to current character on next request</small>`;
+                }
+                if (legacyLatest) {
+                    html += `<br><small style="color:var(--warn);">⚠️ Legacy 'latest' entry (chunking) — will migrate on next auto-summary update</small>`;
+                }
+                info.innerHTML = html;
+            } catch (e) {
+                document.getElementById('autoSummaryInfo').textContent = 'Could not load status';
+            }
+        }
+
+        // Enable chunking (one-shot)
+        async function toggleChunking() {
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({chunking_enabled: true})
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                updateChunkingUI(true);
+                alert('Chunking ENABLED! Go to SillyTavern and send a message.');
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        async function disableChunking() {
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({chunking_enabled: false})
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                updateChunkingUI(false);
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        function updateChunkingUI(enabled) {
+            const btn = document.getElementById('chunkingBtn');
+            const cancelBtn = document.getElementById('chunkingCancelBtn');
+            const status = document.getElementById('chunkingStatus');
+            if (enabled) {
+                btn.textContent = '✓ ARMED';
+                btn.style.background = 'var(--success)';
+                cancelBtn.style.display = 'inline-block';
+                status.textContent = 'READY - Send any message in SillyTavern now!';
+                status.style.color = 'var(--success)';
+            } else {
+                btn.textContent = 'Enable Chunking';
+                btn.style.background = 'var(--accent)';
+                cancelBtn.style.display = 'none';
+                status.textContent = 'Status: Disabled';
+                status.style.color = 'var(--paper-faint)';
+            }
+        }
+
+        // Send test message
+        async function sendTestMessage() {
+            const system = document.getElementById('testSystem').value;
+            const message = document.getElementById('testMessage').value;
+            if (!message.trim()) return alert('Please enter a message');
+
+            const loader = document.getElementById('testLoader');
+            const result = document.getElementById('testResult');
+            loader.style.display = 'inline-block';
+            result.style.display = 'none';
+
+            try {
+                const messages = [];
+                if (system.trim()) {
+                    messages.push({role: 'system', content: system});
+                }
+                messages.push({role: 'user', content: message});
+
+                const response = await fetch('/v1/chat/completions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({messages, stream: false})
+                });
+
+                const data = await response.json();
+                const content = data.choices?.[0]?.message?.content || JSON.stringify(data, null, 2);
+                result.textContent = content;
+                result.style.display = 'block';
+            } catch (e) {
+                result.textContent = 'Error: ' + e.message;
+                result.style.display = 'block';
+            } finally {
+                loader.style.display = 'none';
+            }
+        }
+
+        // Label a cache entry in a way a human can recognize at a glance.
+        // Char-keyed entries borrow the summary's first sentence as their title.
+        function labelForCacheEntry(entry) {
+            if (entry.key === 'latest') {
+                return { kind: 'Chunking (one-shot)', color: 'var(--warn)', hint: entry.key };
+            }
+            if (entry.key === 'auto') {
+                return { kind: 'Legacy auto-summary', color: 'var(--warn)', hint: 'pre-per-character' };
+            }
+            if (entry.key && entry.key.startsWith('auto_')) {
+                const short = entry.key.slice(5, 13);
+                const firstLine = (entry.preview || '').split('\n')[0].slice(0, 70).trim();
+                const title = firstLine || `Character ${short}`;
+                return { kind: title, color: 'var(--accent)', hint: `char: ${short}` };
+            }
+            return { kind: entry.key || 'Unknown', color: 'var(--paper-faint)', hint: '' };
+        }
+
+        // Load cache info with previews
+        async function loadCacheInfo() {
+            try {
+                const response = await fetch('/api/cache');
+                const data = await response.json();
+                const info = document.getElementById('cacheInfo');
+                const entriesDiv = document.getElementById('cacheEntries');
+
+                if (data.count === 0) {
+                    info.textContent = 'Cache is empty';
+                    entriesDiv.innerHTML = '';
+                    return;
+                }
+
+                // Sort: most recent first so the active character is at the top
+                const sortedEntries = [...data.entries].sort((a, b) =>
+                    new Date(b.timestamp || 0) - new Date(a.timestamp || 0)
+                );
+
+                const charCount = sortedEntries.filter(e => e.key && e.key.startsWith('auto_')).length;
+                const legacyCount = sortedEntries.length - charCount;
+                let summary = `${data.count} cached summar${data.count === 1 ? 'y' : 'ies'}`;
+                if (charCount > 0) {
+                    summary += ` — ${charCount} per-character`;
+                    if (legacyCount > 0) summary += `, ${legacyCount} legacy`;
+                }
+                info.textContent = summary;
+
+                let html = '';
+                sortedEntries.forEach((entry, index) => {
+                    const label = labelForCacheEntry(entry);
+                    const date = entry.timestamp ? new Date(entry.timestamp).toLocaleString() : 'Unknown';
+                    const chars = entry.length.toLocaleString();
+                    const tokens = Math.round(entry.length / 4).toLocaleString();
+                    const msgCount = entry.last_message_count || 0;
+                    const coveredUpTo = entry.summarized_up_to || 0;
+
+                    html += `
+                    <div style="background:var(--ink-sunk);margin-bottom:10px;overflow:hidden;border-left:3px solid ${label.color};">
+                        <div style="padding:12px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;gap:10px;" onclick="toggleSummary(${index})">
+                            <div style="min-width:0;flex:1;">
+                                <div style="color:${label.color};font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(label.kind)}</div>
+                                <div style="color:var(--paper-ghost);font-size:11px;margin-top:2px;">
+                                    ${label.hint ? escapeHtml(label.hint) + ' · ' : ''}${date}
+                                </div>
+                            </div>
+                            <div style="color:var(--paper-faint);font-size:12px;text-align:right;white-space:nowrap;">
+                                ${chars} chars<br>
+                                <span style="color:var(--paper-ghost);">~${tokens} tokens · msg ${coveredUpTo}/${msgCount}</span>
+                            </div>
+                            <span id="arrow${index}" style="margin-left:6px;">▼</span>
+                        </div>
+                        <div id="summary${index}" style="display:none;padding:0 12px 12px 12px;">
+                            <div style="background:var(--ink-raised);padding:12px;max-height:400px;overflow-y:auto;">
+                                <pre style="margin:0;white-space:pre-wrap;font-size:12px;color:var(--paper);font-family:var(--font-mono);line-height:1.65;">${escapeHtml(entry.preview)}</pre>
+                            </div>
+                            <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+                                <button class="btn btn-secondary" style="padding:6px 12px;font-size:12px;" onclick="copySummary(${index})">
+                                    Copy Full Summary
+                                </button>
+                                <button class="btn btn-secondary" style="padding:6px 12px;font-size:12px;background:var(--accent-dim);" onclick="deleteCacheEntry('${encodeURIComponent(entry.key)}', event)">
+                                    Delete This Entry
+                                </button>
+                            </div>
+                        </div>
+                    </div>`;
+                });
+                entriesDiv.innerHTML = html;
+
+                // Store full summaries for copying, keyed by the sorted display order
+                window.cachedSummaries = sortedEntries.map(e => e.full);
+            } catch (e) {
+                document.getElementById('cacheInfo').textContent = 'Could not load cache info';
+                console.error(e);
+            }
+        }
+
+        // Delete a single cache entry
+        async function deleteCacheEntry(encodedKey, event) {
+            if (event) event.stopPropagation();
+            const key = decodeURIComponent(encodedKey);
+            if (!confirm(`Delete cache entry "${key}"?\n\nIf this is a character summary, that character will start fresh on the next request.`)) return;
+            try {
+                const response = await fetch(`/api/cache/entry/${encodedKey}`, { method: 'DELETE' });
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    alert('Error: ' + (err.error || response.statusText));
+                    return;
+                }
+                refreshCache();
+            } catch (e) {
+                alert('Error deleting cache entry: ' + e.message);
+            }
+        }
+
+        function toggleSummary(index) {
+            const div = document.getElementById('summary' + index);
+            const arrow = document.getElementById('arrow' + index);
+            if (div.style.display === 'none') {
+                div.style.display = 'block';
+                arrow.textContent = '▲';
+            } else {
+                div.style.display = 'none';
+                arrow.textContent = '▼';
+            }
+        }
+
+        function copySummary(index) {
+            if (window.cachedSummaries && window.cachedSummaries[index]) {
+                navigator.clipboard.writeText(window.cachedSummaries[index]);
+                alert('Summary copied to clipboard!');
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Clear cache
+        async function clearCache() {
+            if (!confirm('Clear all cached summaries?')) return;
+            try {
+                await fetch('/api/cache/clear', {method: 'POST'});
+                document.getElementById('cacheInfo').textContent = 'Cache cleared!';
+                setTimeout(refreshCache, 2000);
+            } catch (e) {
+                alert('Error clearing cache: ' + e.message);
+            }
+        }
+
+        // Refresh cache display
+        async function refreshCache() {
+            await loadCacheInfo();
+            await updateAutoSummaryInfo();
+        }
+
+        // ===== LOREBOOK FUNCTIONS =====
+
+        // Lorebook toggle
+        document.getElementById('lorebookEnabled').addEventListener('change', function() {
+            const enabled = this.checked;
+            document.getElementById('lorebookStatus').textContent = enabled ? 'Enabled' : 'Disabled';
+            saveLorebookSettings();
+        });
+
+        // Save lorebook settings
+        async function saveLorebookSettings() {
+            const settings = {
+                lorebook_enabled: document.getElementById('lorebookEnabled').checked,
+                lorebook_path: document.getElementById('lorebookPath').value,
+                lorebook_name: document.getElementById('lorebookName').value
+            };
+
+            try {
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+                refreshLorebook();
+            } catch (e) {
+                console.error('Error saving lorebook settings:', e);
+            }
+        }
+
+        // Load lorebook info
+        async function refreshLorebook() {
+            try {
+                const response = await fetch('/api/lorebook');
+                const data = await response.json();
+
+                // Update status
+                const dot = document.getElementById('lorebookDot');
+                const status = document.getElementById('lorebookPathStatus');
+
+                if (data.exists) {
+                    dot.style.background = 'var(--success)';
+                    status.innerHTML = `<span style="color:var(--success);">✓</span> Lorebook found: ${data.entry_count} entries<br><small style="color:var(--paper-ghost);">${data.full_path}</small>`;
+                } else {
+                    dot.style.background = 'var(--warn)';
+                    status.innerHTML = `<span style="color:var(--warn);">○</span> Lorebook will be created on first entry<br><small style="color:var(--paper-ghost);">${data.full_path}</small>`;
+                }
+
+                // Update toggle state
+                document.getElementById('lorebookEnabled').checked = data.enabled;
+                document.getElementById('lorebookStatus').textContent = data.enabled ? 'Enabled' : 'Disabled';
+                document.getElementById('lorebookPath').value = data.path;
+                document.getElementById('lorebookName').value = data.filename;
+
+                // Display entries
+                const entriesDiv = document.getElementById('lorebookEntries');
+                if (data.entries.length === 0) {
+                    entriesDiv.innerHTML = '<p style="color:var(--paper-ghost);font-style:italic;">No entries yet</p>';
+                } else {
+                    let html = '';
+                    data.entries.forEach((entry, index) => {
+                        const keywords = entry.keywords.join(', ');
+                        const preview = entry.content.substring(0, 150) + (entry.content.length > 150 ? '...' : '');
+                        const enabledClass = entry.enabled ? '' : 'opacity:0.5;';
+                        const posNames = ['Before Char', 'After Char', 'Before AN', 'After AN', 'At Depth'];
+
+                        html += `
+                        <div style="background:var(--ink-sunk);margin-bottom:8px;${enabledClass}">
+                            <div style="padding:12px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="toggleLoreEntry(${index})">
+                                <div>
+                                    <span style="color:var(--accent);font-weight:bold;">${escapeHtml(entry.name || 'Unnamed')}</span>
+                                    <span style="color:var(--paper-ghost);margin-left:10px;font-size:12px;">${escapeHtml(keywords)}</span>
+                                </div>
+                                <div style="display:flex;gap:10px;align-items:center;">
+                                    <span style="color:var(--paper-ghost);font-size:11px;">${posNames[entry.position] || 'Unknown'}</span>
+                                    <span id="loreArrow${index}">▼</span>
+                                </div>
+                            </div>
+                            <div id="loreContent${index}" style="display:none;padding:0 12px 12px 12px;">
+                                <pre style="margin:0 0 10px 0;white-space:pre-wrap;font-size:12px;color:var(--paper-dim);background:var(--ink-raised);padding:10px;max-height:200px;overflow-y:auto;">${escapeHtml(entry.content)}</pre>
+                                <div style="display:flex;gap:8px;">
+                                    <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="toggleEntryEnabled('${entry.uid}', event)">
+                                        ${entry.enabled ? 'Disable' : 'Enable'}
+                                    </button>
+                                    <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;background:var(--accent-dim);" onclick="deleteLoreEntry('${entry.uid}', event)">
+                                        Delete
+                                    </button>
+                                </div>
+                            </div>
+                        </div>`;
+                    });
+                    entriesDiv.innerHTML = html;
+                }
+            } catch (e) {
+                console.error('Error loading lorebook:', e);
+                document.getElementById('lorebookEntries').innerHTML = '<p style="color:var(--error);">Error loading entries</p>';
+            }
+        }
+
+        function toggleLoreEntry(index) {
+            const div = document.getElementById('loreContent' + index);
+            const arrow = document.getElementById('loreArrow' + index);
+            if (div.style.display === 'none') {
+                div.style.display = 'block';
+                arrow.textContent = '▲';
+            } else {
+                div.style.display = 'none';
+                arrow.textContent = '▼';
+            }
+        }
+
+        async function addLorebookEntry() {
+            const keywords = document.getElementById('entryKeywords').value;
+            const name = document.getElementById('entryName').value;
+            const position = document.getElementById('entryPosition').value;
+            const content = document.getElementById('entryContent').value;
+
+            if (!keywords.trim() || !content.trim()) {
+                alert('Keywords and content are required');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/lorebook/entry', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({keywords, name, position, content})
+                });
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    // Clear form
+                    document.getElementById('entryKeywords').value = '';
+                    document.getElementById('entryName').value = '';
+                    document.getElementById('entryContent').value = '';
+                    refreshLorebook();
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Error adding entry: ' + e.message);
+            }
+        }
+
+        async function deleteLoreEntry(uid, event) {
+            event.stopPropagation();
+            if (!confirm('Delete this lorebook entry?')) return;
+
+            try {
+                await fetch(`/api/lorebook/entry/${uid}`, {method: 'DELETE'});
+                refreshLorebook();
+            } catch (e) {
+                alert('Error deleting entry: ' + e.message);
+            }
+        }
+
+        async function toggleEntryEnabled(uid, event) {
+            event.stopPropagation();
+            try {
+                await fetch(`/api/lorebook/toggle/${uid}`, {method: 'POST'});
+                refreshLorebook();
+            } catch (e) {
+                alert('Error toggling entry: ' + e.message);
+            }
+        }
+
+        async function clearLorebook() {
+            if (!confirm('Clear ALL lorebook entries? This cannot be undone.')) return;
+
+            try {
+                await fetch('/api/lorebook/clear', {method: 'POST'});
+                refreshLorebook();
+            } catch (e) {
+                alert('Error clearing lorebook: ' + e.message);
+            }
+        }
+
+        async function loadChatFiles() {
+            try {
+                const response = await fetch('/api/chats/list');
+                const data = await response.json();
+
+                const select = document.getElementById('chatFileSelect');
+                select.innerHTML = '<option value="">-- Select a chat file --</option>';
+
+                if (data.chats && data.chats.length > 0) {
+                    // Group by character
+                    const byChar = {};
+                    data.chats.forEach(chat => {
+                        if (!byChar[chat.character]) byChar[chat.character] = [];
+                        byChar[chat.character].push(chat);
+                    });
+
+                    for (const [char, chats] of Object.entries(byChar)) {
+                        const group = document.createElement('optgroup');
+                        group.label = char;
+                        chats.forEach(chat => {
+                            const opt = document.createElement('option');
+                            opt.value = chat.path;
+                            const size = (chat.size / 1024).toFixed(1);
+                            const date = new Date(chat.modified).toLocaleDateString();
+                            opt.textContent = `${chat.filename} (${size}KB, ${date})`;
+                            group.appendChild(opt);
+                        });
+                        select.appendChild(group);
+                    }
+                } else if (data.error) {
+                    console.error('Error loading chats:', data.error);
+                }
+            } catch (e) {
+                console.error('Error loading chat files:', e);
+            }
+        }
+
+        function updateChatFilePath() {
+            const select = document.getElementById('chatFileSelect');
+            const input = document.getElementById('chatFilePath');
+            if (select.value) {
+                input.value = select.value;
+            }
+        }
+
+        // Deep model toggle
+        document.querySelectorAll('[data-setting="deep-model"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('[data-setting="deep-model"]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+            });
+        });
+
+        async function triggerQuickAnalysis() {
+            try {
+                const response = await fetch('/api/lorebook/quick-analyze', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({})
+                });
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    alert('Quick analysis started!\n\n' + data.message + '\n\nCheck bridge console for results.');
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        async function triggerDeepAnalysis() {
+            const chatFile = document.getElementById('chatFilePath').value.trim();
+            const useOpus = document.querySelector('[data-setting="deep-model"].active').dataset.value === 'opus';
+            const modelName = useOpus ? 'Opus (thorough)' : 'Sonnet (fast)';
+
+            const msg = chatFile
+                ? `Run deep analysis on:\n${chatFile}\n\n`
+                : 'Run deep analysis on current conversation?\n\n';
+
+            if (!confirm(msg + `• Model: ${modelName}\n• Scans FULL conversation (chunking for long RPs)\n• Can add NEW entries and UPDATE existing ones\n• ${useOpus ? 'May take longer but more thorough' : 'Faster, good for most cases'}\n\nProceed?`)) return;
+
+            // Show loading state
+            const btn = document.getElementById('deepAnalyzeBtn');
+            const originalText = btn.textContent;
+            btn.textContent = 'Analyzing...';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/lorebook/deep-analyze', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({chat_file: chatFile, use_opus: useOpus})
+                });
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    alert(`Deep analysis started!\n\n${data.message}\n\nCheck the bridge console for progress.\nRefresh this page in a few minutes to see new/updated entries.`);
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Error triggering analysis: ' + e.message);
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        // Summary model toggle
+        document.querySelectorAll('[data-setting="summary-model"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('[data-setting="summary-model"]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+            });
+        });
+
+        function updateSummaryFilePath() {
+            const select = document.getElementById('summaryFileSelect');
+            const input = document.getElementById('summaryFilePath');
+            if (select.value) {
+                input.value = select.value;
+            }
+        }
+
+        async function loadSummaryFileSelect() {
+            try {
+                const response = await fetch('/api/chats/list');
+                const data = await response.json();
+
+                const select = document.getElementById('summaryFileSelect');
+                select.innerHTML = '<option value="">-- Select a chat file --</option>';
+
+                if (data.chats && data.chats.length > 0) {
+                    const byChar = {};
+                    data.chats.forEach(chat => {
+                        if (!byChar[chat.character]) byChar[chat.character] = [];
+                        byChar[chat.character].push(chat);
+                    });
+
+                    for (const [char, chats] of Object.entries(byChar)) {
+                        const group = document.createElement('optgroup');
+                        group.label = char;
+                        chats.forEach(chat => {
+                            const opt = document.createElement('option');
+                            opt.value = chat.path;
+                            const size = (chat.size / 1024).toFixed(1);
+                            const date = new Date(chat.modified).toLocaleDateString();
+                            opt.textContent = `${chat.filename} (${size}KB, ${date})`;
+                            group.appendChild(opt);
+                        });
+                        select.appendChild(group);
+                    }
+                }
+            } catch (e) {
+                console.error('Error loading chat files for summary:', e);
+            }
+        }
+
+        async function generateSummaryFromFile() {
+            const chatFile = document.getElementById('summaryFilePath').value.trim();
+            if (!chatFile) {
+                alert('Please select or enter a chat file path');
+                return;
+            }
+
+            const useOpus = document.querySelector('[data-setting="summary-model"].active')?.dataset.value === 'opus';
+            const modelName = useOpus ? 'Opus' : 'Sonnet';
+
+            if (!confirm(`Generate summary from:\n${chatFile}\n\nUsing: ${modelName}\n\nThis may take several minutes for long conversations.`)) return;
+
+            const btn = document.getElementById('genSummaryBtn');
+            const originalText = btn.textContent;
+            btn.textContent = 'Generating...';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/summary/generate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({chat_file: chatFile, use_opus: useOpus})
+                });
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    alert(`Summary generation started!\n\n${data.message}\n\nCheck the bridge console for progress.`);
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        // Initialize — load the default prompt and settings first (the editor
+        // depends on both), then fan out parallel fetches for panels that
+        // don't depend on each other.
+        (async () => {
+            await loadDefaultSystemPrompt();
+            await loadSettings();
+            await Promise.all([
+                loadCacheInfo(),
+                updateAutoSummaryInfo(),
+                refreshLorebook(),
+                loadChatFiles(),
+                loadSummaryFileSelect(),
+            ]);
+        })();
+    </script>
+</body>
+</html>

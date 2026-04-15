@@ -1,0 +1,43 @@
+# Personal runtime state and caches
+bridge_settings.json
+cache/
+temp_images/
+
+# Claude Code's local session state (should never be committed)
+.claude/
+
+# SillyTavern character cards — keep these out of the public repo.
+# They tend to contain personal content and are not part of the bridge itself.
+*.json
+!requirements.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Local helper scripts / notes
+g
+notes.md
+TODO.md
