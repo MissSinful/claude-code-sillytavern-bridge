@@ -328,23 +328,65 @@ def _stringify_content(content):
 def get_character_key(messages):
     """Derive a stable cache key that identifies the current character.
 
-    SillyTavern uses an OpenAI-compatible API with no explicit character field, so
-    we fingerprint the character via the first assistant message (their greeting).
-    It's deterministic per character and doesn't flap the way the system prompt
-    does when world-info or author's-note injections change between turns.
-    Falls back to the system prompt hash if no assistant message exists yet.
+    SillyTavern uses an OpenAI-compatible API with no explicit character field,
+    so we have to fingerprint the active character from the payload itself.
+    Strategy (in order of preference):
+
+    1. Hash the FIRST assistant message in the request. In SillyTavern this is
+       the character greeting — deterministic per character, and doesn't flap
+       the way the system prompt does when world-info injections change.
+
+    2. If there's no assistant message (brand-new chat), hash the FULL system
+       prompt. Long ST jailbreaks can push the character card past a fixed
+       2k slice, so using the whole thing catches character-specific content
+       no matter where it appears.
+
+    3. If neither is available, 'default'.
+
+    Debug output shows which strategy produced the key and a preview of the
+    hashed input — essential when summaries look like they're leaking across
+    characters and you need to see why.
     """
+    strategy = None
+    source = ""
+
     for msg in messages:
         if msg.get("role") == "assistant":
             text = _stringify_content(msg.get("content", ""))
             if text.strip():
-                return hashlib.md5(text[:2000].encode('utf-8')).hexdigest()[:16]
-    for msg in messages:
-        if msg.get("role") == "system":
-            text = _stringify_content(msg.get("content", ""))
-            if text.strip():
-                return hashlib.md5(text[:2000].encode('utf-8')).hexdigest()[:16]
-    return "default"
+                strategy = "first_assistant"
+                source = text[:2000]
+                break
+
+    if strategy is None:
+        # Concatenate ALL system messages — ST sometimes splits jailbreak
+        # and character card across multiple system roles.
+        sys_parts = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                t = _stringify_content(msg.get("content", ""))
+                if t.strip():
+                    sys_parts.append(t)
+        if sys_parts:
+            strategy = "system_prompt_full"
+            source = "\n\n".join(sys_parts)
+
+    if strategy is None:
+        if runtime_settings.get("debug_output"):
+            log("get_character_key: no assistant or system content — using 'default'", "WARN")
+        return "default"
+
+    key = hashlib.md5(source.encode('utf-8')).hexdigest()[:16]
+
+    if runtime_settings.get("debug_output"):
+        preview = source[:60].replace('\n', ' ').replace('\r', ' ').strip()
+        log(
+            f"get_character_key: strategy={strategy} "
+            f"input_len={len(source)} key={key} preview='{preview}...'",
+            "INFO",
+        )
+
+    return key
 
 def get_cached_summary(conv_hash):
     """Get cached summary if it exists."""
