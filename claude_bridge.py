@@ -2096,12 +2096,19 @@ Image files to view:
         # chunks. Downstream SSE generators need this to actually emit content
         # events — otherwise ST receives role + stop + [DONE] and renders
         # a blank message.
+        #
+        # ORDER MATTERS: thinking must fire BEFORE text. generate_stream_response
+        # buffers thinking chunks and flushes them as one clean <think> block
+        # the moment the first text chunk arrives — so if text arrives first
+        # with an empty thinking buffer, the flush happens empty and later
+        # thinking arrivals are silently dropped. Mirroring the natural order
+        # (thinking, then text) keeps both in the stream.
+        if stream_callback and not stream_callback_fired_thinking and thinking_text:
+            stream_callback("thinking", thinking_text)
         if stream_callback and not stream_callback_fired_text and response_text:
             fallback_chunk_size = 80  # chars per synthetic chunk
             for i in range(0, len(response_text), fallback_chunk_size):
                 stream_callback("text", response_text[i:i + fallback_chunk_size])
-        if stream_callback and not stream_callback_fired_thinking and thinking_text:
-            stream_callback("thinking", thinking_text)
 
         # Log thinking if present
         if thinking_text and runtime_settings["show_thinking_console"]:
