@@ -325,55 +325,124 @@ def _stringify_content(content):
         )
     return content or ""
 
+def _extract_character_card(system_text):
+    """Extract the character-specific portion of a SillyTavern system prompt.
+
+    Tries several common SillyTavern character card patterns in order of
+    reliability, returning the matched content (or None if nothing matched).
+    The extracted content is what goes into the character-key hash — hashing
+    a structured card field is more stable than hashing the full system
+    prompt (which flaps with world-info injections) or the first assistant
+    message (which can get trimmed by ST's context limits on long RPs).
+
+    Patterns tried:
+    - <description>...</description> (XML-style templates)
+    - {{char}}'s Description: ... up to the next field
+    - Description: ... up to the next field
+    - {{char}}'s Personality: ... (fallback when description is missing)
+    - Personality: ... (fallback)
+    - [First Message] / First Message: (last resort — captures the greeting
+      embedded in the system prompt before [Start a new Chat])
+    """
+    if not system_text:
+        return None
+
+    # Field terminators — where one character-card field ends and another
+    # begins. Used as the lookahead in each pattern below.
+    terminators = (
+        r"\n\s*(?:description|personality|scenario|appearance|"
+        r"first\s+message|example\s+(?:messages?|dialogue|chat)|"
+        r"\[start\s+a\s+new\s+chat\]|\[example|\[scenario)\b"
+        r"|\Z"
+    )
+
+    patterns = [
+        # XML-style description (some ST templates use this)
+        (r"<description>\s*(.*?)\s*</description>", "xml_description"),
+        # {{char}}'s Description: label
+        (rf"(?:^|\n)\s*(?:\{{\{{char\}}\}}'s\s+)?description:?\s*\n?(.*?)(?={terminators})", "description_field"),
+        # {{char}}'s Personality: fallback
+        (rf"(?:^|\n)\s*(?:\{{\{{char\}}\}}'s\s+)?personality:?\s*\n?(.*?)(?={terminators})", "personality_field"),
+        # {{char}}'s Scenario: fallback
+        (rf"(?:^|\n)\s*(?:\{{\{{char\}}\}}'s\s+)?scenario:?\s*\n?(.*?)(?={terminators})", "scenario_field"),
+        # First Message: fallback — captures the greeting from the system prompt
+        (rf"(?:^|\n)\s*\[?first[\s_-]*mes(?:sage)?\]?:?\s*\n?(.*?)(?={terminators})", "first_message_field"),
+    ]
+
+    for pattern, label in patterns:
+        m = re.search(pattern, system_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            # Sanity check: require substantive content, not just a label
+            # or empty field. 50 chars filters out false positives like
+            # "Description:" immediately followed by another section header.
+            if len(content) >= 50:
+                return (content, label)
+
+    return None
+
+
 def get_character_key(messages):
     """Derive a stable cache key that identifies the current character.
 
-    SillyTavern uses an OpenAI-compatible API with no explicit character field,
-    so we have to fingerprint the active character from the payload itself.
-    Strategy (in order of preference):
+    SillyTavern uses an OpenAI-compatible API with no explicit character
+    field, so we have to fingerprint the active character from the payload
+    itself. Strategy (in order of preference):
 
-    1. Hash the FIRST assistant message in the request. In SillyTavern this is
-       the character greeting — deterministic per character, and doesn't flap
-       the way the system prompt does when world-info injections change.
+    1. EXTRACT the character card from the system prompt — specifically the
+       Description field (or Personality / Scenario / First Message as
+       fallbacks). A structured card field is the most stable identifier:
+       it's unique per character, doesn't flap with world-info injections,
+       and doesn't depend on ST's context-trim behavior.
 
-    2. If there's no assistant message (brand-new chat), hash the FULL system
-       prompt. Long ST jailbreaks can push the character card past a fixed
-       2k slice, so using the whole thing catches character-specific content
-       no matter where it appears.
+    2. Hash the FIRST assistant message in the request. In ST this is usually
+       the character's greeting, which is also unique per character. Used
+       when the system prompt doesn't have extractable card fields (custom
+       templates, raw-prompt setups, etc.).
 
-    3. If neither is available, 'default'.
+    3. Hash the FULL concatenated system prompt content. Last-resort catch-all
+       for configurations where neither the above works.
 
-    Debug output shows which strategy produced the key and a preview of the
-    hashed input — essential when summaries look like they're leaking across
-    characters and you need to see why.
+    Debug output shows which strategy fired and a preview of the hashed input,
+    so stale-summary issues are easy to diagnose from the terminal.
     """
+    # Collect system text once — multiple strategies read it.
+    sys_parts = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            t = _stringify_content(msg.get("content", ""))
+            if t.strip():
+                sys_parts.append(t)
+    system_text = "\n\n".join(sys_parts)
+
     strategy = None
     source = ""
 
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            text = _stringify_content(msg.get("content", ""))
-            if text.strip():
-                strategy = "first_assistant"
-                source = text[:2000]
-                break
+    # Strategy 1: extract a character card field from the system prompt.
+    extracted = _extract_character_card(system_text)
+    if extracted:
+        content, label = extracted
+        strategy = f"card_{label}"
+        source = content
 
+    # Strategy 2: hash the first assistant message (greeting, typically).
     if strategy is None:
-        # Concatenate ALL system messages — ST sometimes splits jailbreak
-        # and character card across multiple system roles.
-        sys_parts = []
         for msg in messages:
-            if msg.get("role") == "system":
-                t = _stringify_content(msg.get("content", ""))
-                if t.strip():
-                    sys_parts.append(t)
-        if sys_parts:
-            strategy = "system_prompt_full"
-            source = "\n\n".join(sys_parts)
+            if msg.get("role") == "assistant":
+                text = _stringify_content(msg.get("content", ""))
+                if text.strip():
+                    strategy = "first_assistant"
+                    source = text[:2000]
+                    break
+
+    # Strategy 3: hash the full concatenated system prompt.
+    if strategy is None and system_text:
+        strategy = "system_prompt_full"
+        source = system_text
 
     if strategy is None:
         if runtime_settings.get("debug_output"):
-            log("get_character_key: no assistant or system content — using 'default'", "WARN")
+            log("get_character_key: no system or assistant content — using 'default'", "WARN")
         return "default"
 
     key = hashlib.md5(source.encode('utf-8')).hexdigest()[:16]
