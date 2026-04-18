@@ -149,6 +149,10 @@ The default system prompt framing is for **adult collaborative fiction**. It inc
 
 If that doesn't match your use case, replace `DEFAULT_BRIDGE_SYSTEM_PROMPT` in `claude_bridge.py` with your own framing, or override it via the System Prompt tab in the GUI.
 
+## Policy & responsibility
+
+This tool doesn't modify or bypass Anthropic's safety systems — it pipes your prompts to the official `claude` CLI using your own subscription via its intended auth flow. Anything Claude would refuse in `claude.ai` it'll still refuse here; the default system prompt steers tone and framing but can't (and doesn't try to) override model-level safety training. Content you generate through this bridge is subject to [Anthropic's Acceptable Use Policy](https://www.anthropic.com/aup), and responsibility for what you prompt and what the model produces stays with you as the subscriber.
+
 ## Maintenance
 
 **Personal project shared for anyone who finds it useful.** I built this for my own SillyTavern + Claude Code workflow and polished it enough to be worth putting up. The architecture is stable, the features work, and the known limitations are documented above. PRs welcome; issues may or may not get responses depending on how relevant they are to my own usage.
