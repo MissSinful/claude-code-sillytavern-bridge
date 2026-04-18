@@ -15,11 +15,25 @@ import os
 import hashlib
 import base64
 import re
+import shutil
 import threading
 import queue
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, render_template
 from flask_cors import CORS
+
+# =============================================================================
+# CLAUDE CLI RESOLUTION
+# =============================================================================
+# Windows installs Claude Code as `claude.cmd` (npm/corepack wrapper), which
+# Python's subprocess.Popen won't find without shell=True unless we resolve
+# the full path first. shutil.which() honors PATHEXT on Windows so it picks
+# up `.cmd` / `.bat` / `.exe` correctly. On Unix it returns `/usr/local/bin/claude`
+# or wherever the binary lives. Resolving once at import time is cheap and
+# avoids the "[WinError 2] The system cannot find the file specified" error
+# users hit when we passed bare "claude" as argv[0].
+CLAUDE_EXE = shutil.which("claude") or "claude"
+
 
 # =============================================================================
 # IMAGE HANDLING
@@ -210,7 +224,7 @@ Image file: {image_path}"""
         )
         process = subprocess.Popen(
             [
-                "claude",
+                CLAUDE_EXE,
                 "-p",
                 "--output-format", "stream-json",
                 "--verbose",
@@ -1067,7 +1081,7 @@ If nothing new: output NO_NEW_LORE"""
 
         process = subprocess.Popen(
             [
-                "claude",
+                CLAUDE_EXE,
                 "-p",
                 "--output-format", "stream-json",
                 "--verbose",
@@ -1340,7 +1354,7 @@ If nothing new worth adding: output NO_NEW_LORE"""
 
             process = subprocess.Popen(
                 [
-                    "claude",
+                    CLAUDE_EXE,
                     "-p",
                     "--output-format", "stream-json",
                     "--verbose",
@@ -2057,7 +2071,7 @@ Image files to view:
     tools_arg = "Read" if all_image_paths else ""
 
     cmd = [
-        "claude",
+        CLAUDE_EXE,
         "-p",
         "--output-format", "stream-json",
         "--verbose",
@@ -3475,7 +3489,7 @@ def generate_summary_from_file():
                 )
 
                 process = subprocess.Popen(
-                    ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", model],
+                    [CLAUDE_EXE, "-p", "--output-format", "stream-json", "--verbose", "--model", model],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -3516,7 +3530,7 @@ def generate_summary_from_file():
                     condense_prompt = load_prompt("condense_chronological", combined=combined)
 
                     process = subprocess.Popen(
-                        ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", model],
+                        [CLAUDE_EXE, "-p", "--output-format", "stream-json", "--verbose", "--model", model],
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
