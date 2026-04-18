@@ -27,12 +27,83 @@ from flask_cors import CORS
 # =============================================================================
 # Windows installs Claude Code as `claude.cmd` (npm/corepack wrapper), which
 # Python's subprocess.Popen won't find without shell=True unless we resolve
-# the full path first. shutil.which() honors PATHEXT on Windows so it picks
-# up `.cmd` / `.bat` / `.exe` correctly. On Unix it returns `/usr/local/bin/claude`
-# or wherever the binary lives. Resolving once at import time is cheap and
-# avoids the "[WinError 2] The system cannot find the file specified" error
-# users hit when we passed bare "claude" as argv[0].
-CLAUDE_EXE = shutil.which("claude") or "claude"
+# the full path first. shutil.which() handles the common case (claude is on
+# PATH). A surprising number of Windows users install claude via
+# `npm install -g` which drops claude.cmd into `%APPDATA%\npm`, and that
+# directory is NOT automatically on PATH on every Windows install — so we
+# check a handful of common install locations as a fallback before giving
+# up. If nothing is found, we print a prominent warning at startup so the
+# first request doesn't die with the cryptic `[WinError 2] The system
+# cannot find the file specified`.
+
+
+def _find_claude_exe():
+    """Locate the claude CLI executable across platforms.
+
+    Returns an absolute path, or None if nothing found (caller decides what
+    to do — we fall back to the bare name 'claude' so the bridge still
+    boots with a diagnostic error at startup).
+    """
+    # Fast path: PATH-based lookup. Honors PATHEXT on Windows so it picks
+    # up `.cmd` / `.bat` / `.exe` correctly.
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    # Fallback candidates — locations where npm/installers commonly drop
+    # the CLI but PATH might not cover. We stat each one; first hit wins.
+    candidates = []
+    if sys.platform == "win32":
+        candidates = [
+            os.path.expandvars(r"%APPDATA%\npm\claude.cmd"),
+            os.path.expandvars(r"%APPDATA%\npm\claude.ps1"),
+            os.path.expandvars(r"%APPDATA%\npm\claude.exe"),
+            os.path.expandvars(r"%USERPROFILE%\.local\bin\claude.exe"),
+            os.path.expandvars(r"%USERPROFILE%\.local\bin\claude.cmd"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\claude\claude.exe"),
+            r"C:\Program Files\nodejs\claude.cmd",
+        ]
+    else:
+        candidates = [
+            os.path.expanduser("~/.local/bin/claude"),
+            "/usr/local/bin/claude",
+            "/opt/homebrew/bin/claude",
+            "/usr/bin/claude",
+        ]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    return None
+
+
+CLAUDE_EXE = _find_claude_exe()
+
+if CLAUDE_EXE is None:
+    # Loud startup warning so first-run users see the actual problem
+    # ("CLI not installed / not in PATH") instead of a bare WinError 2 the
+    # first time they send a message from SillyTavern.
+    print()
+    print("=" * 62)
+    print(" WARNING: Claude CLI not found")
+    print("-" * 62)
+    print(" The bridge couldn't locate `claude` in PATH or in any of the")
+    print(" common install locations. Requests WILL fail until this is")
+    print(" fixed. Typical causes and fixes:")
+    print()
+    print("   1. You haven't installed Claude Code CLI yet.")
+    print("      Install from:")
+    print("        https://docs.anthropic.com/en/docs/claude-code")
+    print()
+    print("   2. You installed via `npm install -g` but the npm global")
+    print("      bin (usually %APPDATA%\\npm on Windows) isn't on PATH.")
+    print("      Add it to your user PATH and restart the terminal.")
+    print()
+    print(" Verify with:  claude --version")
+    print("=" * 62)
+    print()
+    CLAUDE_EXE = "claude"  # Let the bridge start; requests will fail with a clear error.
 
 
 # =============================================================================
@@ -2337,6 +2408,23 @@ Image files to view:
             "tool_calls": tool_calls
         }
 
+    except FileNotFoundError as e:
+        # Most common on Windows when the claude CLI isn't on PATH and our
+        # startup-time fallback search didn't hit any of the known locations.
+        # Give the user a concrete next step instead of a raw WinError 2.
+        log(f"Claude CLI not found: {str(e)}", "ERROR")
+        log(f"Looked for: {CLAUDE_EXE}", "ERROR")
+        log("Fix: install Claude Code and ensure `claude --version` works in a new terminal.", "ERROR")
+        log("     https://docs.anthropic.com/en/docs/claude-code", "ERROR")
+        return {
+            "response": (
+                "**Bridge error — Claude CLI not found.** Install Claude Code "
+                "(https://docs.anthropic.com/en/docs/claude-code) and make sure "
+                "`claude --version` works from a new terminal. On Windows, npm's "
+                "global bin (%APPDATA%\\npm) must be on PATH."
+            ),
+            "thinking": None,
+        }
     except Exception as e:
         log(f"Exception: {str(e)}", "ERROR")
         # Try to kill the process if it's still running
