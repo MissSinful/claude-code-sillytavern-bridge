@@ -325,59 +325,37 @@ def _stringify_content(content):
         )
     return content or ""
 
-def _extract_character_card(system_text):
-    """Extract the character-specific portion of a SillyTavern system prompt.
+def _extract_character_name(system_text):
+    """Extract the character name from SillyTavern's standard wrapping patterns.
 
-    Tries several common SillyTavern character card patterns in order of
-    reliability, returning the matched content (or None if nothing matched).
-    The extracted content is what goes into the character-key hash — hashing
-    a structured card field is more stable than hashing the full system
-    prompt (which flaps with world-info injections) or the first assistant
-    message (which can get trimmed by ST's context limits on long RPs).
+    ST's default personality_format wraps injected personality as
+    "[{{char}}'s personality: {{personality}}]", which renders with the actual
+    character name in place of {{char}}: "[Morgan's personality: ...]". This
+    wrapping is specifically produced by ST when it injects a character card
+    — it doesn't appear in preset prompts or the bridge's system prompt, so
+    matching it gives us a stable, character-specific identifier that can't
+    collide across characters that share preset boilerplate.
 
-    Patterns tried:
-    - <description>...</description> (XML-style templates)
-    - {{char}}'s Description: ... up to the next field
-    - Description: ... up to the next field
-    - {{char}}'s Personality: ... (fallback when description is missing)
-    - Personality: ... (fallback)
-    - [First Message] / First Message: (last resort — captures the greeting
-      embedded in the system prompt before [Start a new Chat])
+    Also handles description/scenario/persona variants for presets that wrap
+    those fields instead of (or in addition to) personality.
+
+    Returns the extracted name (string) or None if no pattern matches.
     """
     if not system_text:
         return None
 
-    # Field terminators — where one character-card field ends and another
-    # begins. Used as the lookahead in each pattern below.
-    terminators = (
-        r"\n\s*(?:description|personality|scenario|appearance|"
-        r"first\s+message|example\s+(?:messages?|dialogue|chat)|"
-        r"\[start\s+a\s+new\s+chat\]|\[example|\[scenario)\b"
-        r"|\Z"
-    )
-
-    patterns = [
-        # XML-style description (some ST templates use this)
-        (r"<description>\s*(.*?)\s*</description>", "xml_description"),
-        # {{char}}'s Description: label
-        (rf"(?:^|\n)\s*(?:\{{\{{char\}}\}}'s\s+)?description:?\s*\n?(.*?)(?={terminators})", "description_field"),
-        # {{char}}'s Personality: fallback
-        (rf"(?:^|\n)\s*(?:\{{\{{char\}}\}}'s\s+)?personality:?\s*\n?(.*?)(?={terminators})", "personality_field"),
-        # {{char}}'s Scenario: fallback
-        (rf"(?:^|\n)\s*(?:\{{\{{char\}}\}}'s\s+)?scenario:?\s*\n?(.*?)(?={terminators})", "scenario_field"),
-        # First Message: fallback — captures the greeting from the system prompt
-        (rf"(?:^|\n)\s*\[?first[\s_-]*mes(?:sage)?\]?:?\s*\n?(.*?)(?={terminators})", "first_message_field"),
-    ]
-
-    for pattern, label in patterns:
-        m = re.search(pattern, system_text, re.IGNORECASE | re.DOTALL)
-        if m:
-            content = m.group(1).strip()
-            # Sanity check: require substantive content, not just a label
-            # or empty field. 50 chars filters out false positives like
-            # "Description:" immediately followed by another section header.
-            if len(content) >= 50:
-                return (content, label)
+    # Match "[NAME's (personality|description|scenario|persona):". The bracket
+    # plus literal "'s <field>:" anchors this to ST's injected wrapping, not
+    # to arbitrary prose that happens to contain those words. Greedy
+    # [^\]]{1,80} allows names with internal apostrophes (O'Brien, etc.) —
+    # the regex engine backtracks to find the trailing 's <field>:.
+    pattern = r"\[([^\]]{1,80})'s\s+(?:personality|description|scenario|persona)\s*:"
+    m = re.search(pattern, system_text, re.IGNORECASE)
+    if m:
+        name = m.group(1).strip()
+        # Reject empty captures or unsubstituted template variables.
+        if name and not name.startswith(("{{", "<")):
+            return name
 
     return None
 
@@ -386,22 +364,23 @@ def get_character_key(messages):
     """Derive a stable cache key that identifies the current character.
 
     SillyTavern uses an OpenAI-compatible API with no explicit character
-    field, so we have to fingerprint the active character from the payload
-    itself. Strategy (in order of preference):
+    field, so we fingerprint the active character from the payload itself.
+    Strategy (in order of preference):
 
-    1. EXTRACT the character card from the system prompt — specifically the
-       Description field (or Personality / Scenario / First Message as
-       fallbacks). A structured card field is the most stable identifier:
-       it's unique per character, doesn't flap with world-info injections,
-       and doesn't depend on ST's context-trim behavior.
+    1. EXTRACT the character name from ST's personality_format wrapping
+       ("[NAME's personality: ...]"). This wrapping is specifically produced
+       by ST when it injects a character card — preset prompts and the
+       bridge's own system prompt don't use it, so a match here is always
+       character-specific and can't collide across characters that share
+       preset content.
 
-    2. Hash the FIRST assistant message in the request. In ST this is usually
-       the character's greeting, which is also unique per character. Used
-       when the system prompt doesn't have extractable card fields (custom
-       templates, raw-prompt setups, etc.).
+    2. Hash the FIRST assistant message in the request. In ST this is
+       usually the character's greeting, which is also unique per character.
+       Used when the preset doesn't wrap fields with the [NAME's <field>:]
+       format.
 
     3. Hash the FULL concatenated system prompt content. Last-resort catch-all
-       for configurations where neither the above works.
+       for edge configurations where neither of the above works.
 
     Debug output shows which strategy fired and a preview of the hashed input,
     so stale-summary issues are easy to diagnose from the terminal.
@@ -418,22 +397,46 @@ def get_character_key(messages):
     strategy = None
     source = ""
 
-    # Strategy 1: extract a character card field from the system prompt.
-    extracted = _extract_character_card(system_text)
-    if extracted:
-        content, label = extracted
-        strategy = f"card_{label}"
-        source = content
+    # Strategy 1: extract the character name from ST's wrapping pattern.
+    name = _extract_character_name(system_text)
+    if name:
+        strategy = "name"
+        source = name
 
-    # Strategy 2: hash the first assistant message (greeting, typically).
+    # Strategy 2: hash the character's greeting.
+    # Presets commonly inject SHORT assistant-role directives anywhere in
+    # the payload (chat-start ceremonies, OOC system-speakers, etc.) whose
+    # content is shared across all characters using that preset. We filter
+    # those out with a length floor — real character greetings are
+    # substantive narrative (hundreds of chars at minimum), preset directives
+    # are short boilerplate. The first substantive assistant message is
+    # essentially always the greeting, regardless of where in the payload it
+    # sits (ST can interleave user/assistant in unusual orders depending on
+    # the preset's turn-composition logic).
     if strategy is None:
+        GREETING_MIN_CHARS = 200
+
+        candidates = []
         for msg in messages:
             if msg.get("role") == "assistant":
-                text = _stringify_content(msg.get("content", ""))
-                if text.strip():
-                    strategy = "first_assistant"
-                    source = text[:2000]
-                    break
+                text = _stringify_content(msg.get("content", "")).strip()
+                if text and len(text) >= GREETING_MIN_CHARS:
+                    candidates.append(text)
+                    break  # First substantive assistant = the greeting
+
+        # Fallback: no assistant message cleared the threshold. Take the
+        # first short one so Strategy 3 isn't forced.
+        if not candidates:
+            for msg in messages:
+                if msg.get("role") == "assistant":
+                    text = _stringify_content(msg.get("content", "")).strip()
+                    if text:
+                        candidates.append(text)
+                        break
+
+        if candidates:
+            strategy = "first_assistant"
+            source = candidates[0][:2000]
 
     # Strategy 3: hash the full concatenated system prompt.
     if strategy is None and system_text:
@@ -1805,34 +1808,72 @@ def log(message: str, level: str = "INFO"):
         sys.stdout.flush()
 
 
+# Shared width for section headers and stat boxes — keeps them visually
+# aligned so they read as one consistent style.
+_SECTION_WIDTH = 52
+
+
 def log_section(title: str):
-    """Print a section header."""
-    width = 50
+    """Print a lightweight single-line section marker.
+
+    Used for standalone section boundaries in the log ("Thinking",
+    "Lorebook Updates", etc.) where a full 3-line box is overkill. For
+    structured stats, use log_box(title, stats) instead.
+    """
+    title_str = f" {title.upper()} "
+    tail = max(3, _SECTION_WIDTH - 2 - len(title_str))
     print()
-    print(f"{Colors.CYAN}{Colors.BOLD}┌{'─' * width}┐{Colors.RESET}")
-    print(f"{Colors.CYAN}{Colors.BOLD}│ {title.upper():<{width-1}}│{Colors.RESET}")
-    print(f"{Colors.CYAN}{Colors.BOLD}└{'─' * width}┘{Colors.RESET}")
+    print(f"{Colors.CYAN}──{title_str}{'─' * tail}{Colors.RESET}")
 
 
-def log_stats(stats: dict):
-    """Print statistics in a formatted box."""
-    print(f"{Colors.DIM}┌{'─' * 35}┐{Colors.RESET}")
+def log_box(title: str, stats: dict):
+    """Print a connected box: title inset into the top border, then stats.
+
+    Replaces the old log_section + log_stats combo, which rendered as two
+    disconnected boxes of different widths. Everything here uses a single
+    width (_SECTION_WIDTH) and the title is embedded in the top border for
+    one visually unified block.
+    """
+    width = _SECTION_WIDTH
+    print()
+
+    # Top border: ┌─ TITLE ──────────┐
+    title_str = f" {title.upper()} "
+    tail = max(1, width - 3 - len(title_str))  # -3 covers ┌ + leading ─ + ┐
+    print(f"{Colors.CYAN}{Colors.BOLD}┌─{title_str}{'─' * tail}┐{Colors.RESET}")
+
+    # Stat rows: │ key                     value │
     for key, value in stats.items():
         if isinstance(value, int) and value > 999:
             value = f"{value:,}"
-        print(f"{Colors.DIM}│{Colors.RESET} {key:<20} {Colors.GREEN}{value:>12}{Colors.RESET} {Colors.DIM}│{Colors.RESET}")
-    print(f"{Colors.DIM}└{'─' * 35}┘{Colors.RESET}")
+        key_str = str(key)
+        val_str = str(value)
+        pad = max(1, width - 4 - len(key_str) - len(val_str))
+        print(
+            f"{Colors.CYAN}│{Colors.RESET} {key_str}"
+            f"{' ' * pad}"
+            f"{Colors.GREEN}{val_str}{Colors.RESET} {Colors.CYAN}│{Colors.RESET}"
+        )
+
+    # Bottom border
+    print(f"{Colors.CYAN}{Colors.BOLD}└{'─' * (width - 2)}┘{Colors.RESET}")
 
 
 # log() is now defined — safe to load persisted settings from disk.
 load_persisted_settings()
 
 
-def call_claude_code(messages: list, stream: bool = False, tools: list = None, stream_callback=None) -> dict:
+def call_claude_code(messages: list, stream: bool = False, tools: list = None, stream_callback=None, process_holder: dict = None) -> dict:
     """
     Call Claude Code CLI with the given messages.
     Converts OpenAI message format to a prompt for Claude.
     Uses stdin to avoid Windows command line length limits.
+
+    process_holder: optional dict. If supplied, the subprocess handle is stored
+    under the "process" key as soon as it's spawned, so callers (like the SSE
+    streaming generator) can kill the subprocess from outside if the client
+    disconnects mid-response. Passing None (default) preserves the prior
+    fire-and-forget behavior.
 
     If stream_callback is provided, it will be invoked with (kind, chunk)
     tuples as deltas arrive from the subprocess, where kind is "text" or
@@ -1850,24 +1891,6 @@ def call_claude_code(messages: list, stream: bool = False, tools: list = None, s
     # Find the last 5 message indices to process images from (any role)
     # SillyTavern may put attachments in system messages
     recent_msg_indices = set(range(max(0, len(messages) - 5), len(messages)))
-
-    if runtime_settings.get("debug_output"):
-        log(f"Image detection: checking last 5 messages for images...", "INFO")
-        # Debug: show what's in the last 5 messages regardless of role
-        for idx in range(max(0, len(messages) - 5), len(messages)):
-            msg = messages[idx]
-            role = msg.get("role", "?")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                part_types = [p.get("type", "?") for p in content]
-                has_image = "image_url" in part_types
-                log(f"  [{idx}] {role}: multipart {part_types} {'📷 HAS IMAGE' if has_image else ''}", "INFO")
-            elif isinstance(content, str):
-                has_base64 = "data:image" in content
-                has_marker = "[IMAGE:" in content
-                flag = "📷 HAS IMAGE" if has_base64 else ("🖼️ HAS MARKER" if has_marker else "")
-                preview = content[:40].replace('\n', ' ')
-                log(f"  [{idx}] {role}: {len(content)} chars {flag} '{preview}...'", "INFO")
 
     for idx, msg in enumerate(messages):
         role = msg.get("role", "user")
@@ -1961,22 +1984,12 @@ def call_claude_code(messages: list, stream: bool = False, tools: list = None, s
 
     prompt = "\n\n".join(prompt_parts)
 
-    # Log the request
-    log(f"Received request with {len(messages)} messages")
-    if VERBOSE:
-        # Show last user message
-        last_user = next((m["content"][:100] for m in reversed(messages) if m["role"] == "user"), "N/A")
-        log(f"Last user message: {last_user}...")
-
     # Temp files for cleanup
     temp_files = []
 
     # Handle system prompt
     core_identity = None
     if system_prompt:
-        if VERBOSE:
-            log(f"System prompt ({len(system_prompt)} chars): {system_prompt[:100]}...")
-
         # Single source of truth for the default prompt (see DEFAULT_BRIDGE_SYSTEM_PROMPT).
         core_identity = runtime_settings.get("system_prompt_override") or DEFAULT_BRIDGE_SYSTEM_PROMPT
 
@@ -2058,7 +2071,7 @@ Image files to view:
         cmd.extend(["--system-prompt", core_identity])
 
     if all_image_paths:
-        log(f"📷 Images detected: {len(all_image_paths)} - enabling Read tool", "SUCCESS")
+        log(f"Images detected: {len(all_image_paths)} — enabling Read tool", "SUCCESS")
         for img_path in all_image_paths:
             log(f"  → {img_path}", "INFO")
 
@@ -2079,6 +2092,11 @@ Image files to view:
             encoding="utf-8",
             bufsize=1,
         )
+
+        # Expose the subprocess handle to the caller so they can cancel us
+        # (e.g. on client disconnect in the SSE generator).
+        if process_holder is not None:
+            process_holder["process"] = process
 
         # Send prompt and close stdin
         process.stdin.write(prompt)
@@ -2181,7 +2199,6 @@ Image files to view:
                         cache_creation = usage.get("cache_creation_input_tokens", 0)
                         cost = event.get("total_cost_usd", 0)
 
-                        log_section("Token Usage")
                         stats = {"Input": input_tokens, "Output": output_tokens}
                         if cache_read:
                             stats["Cache read"] = cache_read
@@ -2190,7 +2207,7 @@ Image files to view:
                         stats["Total"] = input_tokens + output_tokens
                         if cost:
                             stats["Cost"] = f"${cost:.4f}"
-                        log_stats(stats)
+                        log_box("Token Usage", stats)
 
             except json.JSONDecodeError:
                 continue
@@ -2200,6 +2217,18 @@ Image files to view:
         stderr = process.stderr.read()
 
         elapsed = time.time() - start_time
+
+        # Distinguish a normal non-zero exit from a cancellation-via-kill.
+        # The SSE / non-streaming generators set process_holder["cancelled"]
+        # when they kill the subprocess on client disconnect; without this,
+        # the subsequent non-zero exit code would be logged as a scary ERROR
+        # instead of the expected "user hit Stop" WARN.
+        cancelled = bool(process_holder and process_holder.get("cancelled"))
+
+        if cancelled:
+            log(f"Claude cancelled after {elapsed:.1f}s (client disconnect)", "WARN")
+            return {"response": "", "thinking": None, "tool_calls": []}
+
         log(f"Response received in {elapsed:.1f}s", "SUCCESS")
 
         if process.returncode != 0:
@@ -2475,13 +2504,16 @@ def generate_stream_response(messages: list, tools: list = None):
     # mixed <think>/<thinking> variants, or orphaned [Tools]/[Context] sections.
     q = queue.Queue()
     worker_result = {}
+    # Shared holder so we can kill the Claude subprocess if the client
+    # disconnects mid-stream (e.g. the user hits Stop in SillyTavern).
+    process_holder = {}
 
     def on_chunk(kind: str, chunk: str):
         q.put((kind, chunk))
 
     def worker():
         try:
-            result = call_claude_code(messages, stream_callback=on_chunk)
+            result = call_claude_code(messages, stream_callback=on_chunk, process_holder=process_holder)
             worker_result["result"] = result
         except Exception as e:
             worker_result["error"] = str(e)
@@ -2530,47 +2562,74 @@ def generate_stream_response(messages: list, tools: list = None):
     # Emit an initial delta with just the role. Do NOT include an empty content
     # field — some SillyTavern parsers treat {"content":""} as "message done
     # with no text" and ignore subsequent content deltas.
-    yield _sse_delta(response_id, {"role": "assistant"})
+    try:
+        yield _sse_delta(response_id, {"role": "assistant"})
 
-    while True:
-        kind, chunk = q.get()
-        if kind == "__done__":
-            break
-        if kind == "thinking":
-            if not include_thinking:
+        while True:
+            # Poll with a timeout instead of blocking indefinitely, so we can
+            # emit SSE keepalive comments during long waits (thinking, tool
+            # use, etc.). Werkzeug only discovers that the client has
+            # disconnected when it tries to write — without periodic writes,
+            # a user who hits Stop in SillyTavern goes undetected and Claude
+            # runs to completion anyway. The keepalive forces a write
+            # attempt; if it fails, the exception propagates back to this
+            # yield and the outer finally kills the subprocess.
+            try:
+                kind, chunk = q.get(timeout=1.0)
+            except queue.Empty:
+                yield ": keepalive\n\n"
                 continue
-            thinking_buffer.append(chunk)
-        elif kind == "text":
-            # First text chunk — flush the accumulated thinking as one clean block.
-            if not thinking_flushed:
-                block = build_think_block(thinking_buffer) if thinking_buffer else ""
-                if block:
-                    yield _sse_delta(response_id, {"content": block})
-                thinking_flushed = True
-            text_buffer.append(chunk)
-            any_text_emitted = True
-            yield _sse_delta(response_id, {"content": chunk})
-            # Pace the stream so ST renders it incrementally rather than in one burst.
-            if chunk_delay > 0:
-                time.sleep(chunk_delay)
+            if kind == "__done__":
+                break
+            if kind == "thinking":
+                if not include_thinking:
+                    continue
+                thinking_buffer.append(chunk)
+            elif kind == "text":
+                # First text chunk — flush the accumulated thinking as one clean block.
+                if not thinking_flushed:
+                    block = build_think_block(thinking_buffer) if thinking_buffer else ""
+                    if block:
+                        yield _sse_delta(response_id, {"content": block})
+                    thinking_flushed = True
+                text_buffer.append(chunk)
+                any_text_emitted = True
+                yield _sse_delta(response_id, {"content": chunk})
+                # Pace the stream so ST renders it incrementally rather than in one burst.
+                if chunk_delay > 0:
+                    time.sleep(chunk_delay)
 
-    # Thinking-only case: Claude produced no text (shouldn't normally happen,
-    # but handle it). Flush the think block so the user sees the reasoning.
-    if not thinking_flushed and thinking_buffer:
-        block = build_think_block(thinking_buffer)
-        if block:
-            yield _sse_delta(response_id, {"content": block})
+        # Thinking-only case: Claude produced no text (shouldn't normally happen,
+        # but handle it). Flush the think block so the user sees the reasoning.
+        if not thinking_flushed and thinking_buffer:
+            block = build_think_block(thinking_buffer)
+            if block:
+                yield _sse_delta(response_id, {"content": block})
 
-    # Surface worker errors after the stream if one happened before any text.
-    if "error" in worker_result and not any_text_emitted:
-        yield _sse_delta(
-            response_id,
-            {"content": f"[bridge error: {worker_result['error']}]"},
-        )
+        # Surface worker errors after the stream if one happened before any text.
+        if "error" in worker_result and not any_text_emitted:
+            yield _sse_delta(
+                response_id,
+                {"content": f"[bridge error: {worker_result['error']}]"},
+            )
 
-    # Final stop event + OpenAI terminator
-    yield _sse_delta(response_id, {}, finish_reason="stop")
-    yield "data: [DONE]\n\n"
+        # Final stop event + OpenAI terminator
+        yield _sse_delta(response_id, {}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+    finally:
+        # Kill the Claude subprocess if it's still running. Covers normal
+        # completion (subprocess already exited → poll() != None → no-op) and
+        # client disconnect mid-stream (user hit Stop in SillyTavern → Flask
+        # closes the generator → we kill the subprocess so we stop accruing
+        # model wait time on a response nobody will read).
+        proc = process_holder.get("process")
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+                process_holder["cancelled"] = True
+                log("Client disconnected mid-stream — killed Claude subprocess", "WARN")
+            except Exception as e:
+                log(f"Failed to kill Claude subprocess on disconnect: {e}", "ERROR")
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
@@ -2588,20 +2647,18 @@ def chat_completions():
 
         # Debug: Log what we're receiving from SillyTavern
         if runtime_settings["debug_output"]:
-            log_section("Incoming Request")
-
             # Count by role
             role_counts = {}
             for m in messages:
                 role = m.get("role", "unknown")
                 role_counts[role] = role_counts.get(role, 0) + 1
 
-            log_stats({
+            log_box("Incoming Request", {
                 "Messages": len(messages),
                 "System": role_counts.get("system", 0),
                 "User": role_counts.get("user", 0),
                 "Assistant": role_counts.get("assistant", 0),
-                "Stream": "Yes" if stream else "No"
+                "Stream": "Yes" if stream else "No",
             })
 
             if tools:
@@ -2618,10 +2675,9 @@ def chat_completions():
             use_summary, summary_text, recent_messages = process_auto_summary(messages)
 
             if use_summary and summary_text:
-                log_section("Auto-Summary Active")
-                log_stats({
+                log_box("Auto-Summary Active", {
                     "Summary size": f"{len(summary_text):,} chars",
-                    "Recent msgs": len(recent_messages)
+                    "Recent msgs": len(recent_messages),
                 })
 
                 # Debug: Show what we're actually sending
@@ -2841,76 +2897,123 @@ Now, based on this context, please respond to the following request:
                     }
                 )
 
-        # Non-streaming response (or streaming with tools)
-        result = call_claude_code(messages, tools=tools)
-        response_text = result["response"]
-        thinking_text = result.get("thinking")
-        tool_calls = result.get("tool_calls")
+        # Non-streaming response (or streaming with tools).
+        #
+        # We run call_claude_code on a worker thread and drive the response
+        # as a generator that yields whitespace keepalives every second while
+        # Claude thinks, then yields the final JSON at the end. The keepalive
+        # yields force Werkzeug to write to the socket periodically — if the
+        # client disconnected (user hit Stop in SillyTavern), the write fails,
+        # the exception propagates back to the yield, and the finally block
+        # kills the Claude subprocess so we stop burning model time on a
+        # response nobody will read.
+        #
+        # Leading whitespace in a JSON response is spec-legal (RFC 8259) and
+        # every mainstream JSON parser tolerates it, so clients see a valid
+        # chat-completions payload at the end of the stream either way.
+        process_holder = {}
+        result_holder = {}
 
-        response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        def worker():
+            try:
+                result_holder["result"] = call_claude_code(
+                    messages, tools=tools, process_holder=process_holder
+                )
+            except Exception as e:
+                log(f"Non-streaming worker crashed: {e}", "ERROR")
+                result_holder["error"] = str(e)
 
-        # If there are tool calls, return tool call format
-        if tool_calls:
-            log(f"Returning {len(tool_calls)} tool call(s) to SillyTavern")
-            for tc in tool_calls:
-                log(f"  Tool: {tc['function']['name']} | ID: {tc['id']}")
-                log(f"  Args: {tc['function']['arguments'][:200]}...")
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
 
-            # Build message with tool calls
-            # Note: content must be empty string, not null, for SillyTavern compatibility
-            message = {
-                "role": "assistant",
-                "content": response_text if response_text else "",
-                "tool_calls": tool_calls
-            }
+        def response_generator():
+            try:
+                # Wait for the worker, yielding whitespace keepalives so we
+                # can detect client disconnect during the long Claude wait.
+                while worker_thread.is_alive():
+                    worker_thread.join(timeout=1.0)
+                    if worker_thread.is_alive():
+                        yield " "  # JSON-valid whitespace
 
-            response_obj = {
-                "id": response_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": DEFAULT_MODEL,
-                "choices": [{
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": "stop"  # Some implementations expect "stop" even with tool_calls
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            }
+                # Worker finished — build and yield the final JSON response.
+                if "error" in result_holder:
+                    yield json.dumps({
+                        "error": {
+                            "message": result_holder["error"],
+                            "type": "bridge_error",
+                        }
+                    })
+                    return
 
-            log(f"Tool call response JSON: {json.dumps(response_obj)[:500]}...")
-            # Trigger background lorebook analysis
-            trigger_lorebook_analysis(messages)
-            return jsonify(response_obj)
+                result = result_holder["result"]
+                response_text = result["response"]
+                thinking_text = result.get("thinking")
+                tool_calls = result.get("tool_calls")
+                response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
-        # Optionally prepend thinking
-        if runtime_settings["include_thinking"] and thinking_text:
-            response_text = f"<think>\n{thinking_text}\n</think>\n\n{response_text}"
+                if tool_calls:
+                    log(f"Returning {len(tool_calls)} tool call(s) to SillyTavern")
+                    for tc in tool_calls:
+                        log(f"  Tool: {tc['function']['name']} | ID: {tc['id']}")
+                        log(f"  Args: {tc['function']['arguments'][:200]}...")
 
-        # Consolidate multiple think blocks into one (ST only supports one)
-        response_text = consolidate_think_blocks(response_text)
+                    message = {
+                        "role": "assistant",
+                        "content": response_text if response_text else "",
+                        "tool_calls": tool_calls,
+                    }
+                    response_obj = {
+                        "id": response_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": DEFAULT_MODEL,
+                        "choices": [{
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    }
+                    log(f"Tool call response JSON: {json.dumps(response_obj)[:500]}...")
+                    trigger_lorebook_analysis(messages)
+                    yield json.dumps(response_obj)
+                    return
 
-        # Trigger background lorebook analysis (after responding, uses separate Claude call)
-        trigger_lorebook_analysis(messages)
+                if runtime_settings["include_thinking"] and thinking_text:
+                    response_text = f"<think>\n{thinking_text}\n</think>\n\n{response_text}"
 
-        return jsonify({
-            "id": response_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": DEFAULT_MODEL,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            }
-        })
+                response_text = consolidate_think_blocks(response_text)
+                trigger_lorebook_analysis(messages)
+
+                yield json.dumps({
+                    "id": response_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": DEFAULT_MODEL,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": response_text,
+                        },
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                })
+            finally:
+                # Same cancel-on-disconnect semantics as the SSE streaming
+                # path: the whitespace keepalives above force periodic writes
+                # so Werkzeug surfaces a closed socket, which lands here.
+                proc = process_holder.get("process")
+                if proc and proc.poll() is None:
+                    try:
+                        proc.kill()
+                        process_holder["cancelled"] = True
+                        log("Client disconnected — killed Claude subprocess", "WARN")
+                    except Exception as e:
+                        log(f"Failed to kill Claude subprocess on disconnect: {e}", "ERROR")
+
+        return Response(response_generator(), mimetype="application/json")
 
     except Exception as e:
         log(f"Error in chat_completions: {str(e)}", "ERROR")
@@ -3758,7 +3861,7 @@ PARTIAL ANALYSES:
 if __name__ == "__main__":
     print()
     print(f"{Colors.CYAN}{Colors.BOLD}╔══════════════════════════════════════════════════════════╗{Colors.RESET}")
-    print(f"{Colors.CYAN}{Colors.BOLD}║          🌉 CLAUDE CODE BRIDGE SERVER                    ║{Colors.RESET}")
+    print(f"{Colors.CYAN}{Colors.BOLD}║               CLAUDE CODE BRIDGE SERVER                  ║{Colors.RESET}")
     print(f"{Colors.CYAN}{Colors.BOLD}╚══════════════════════════════════════════════════════════╝{Colors.RESET}")
     print()
     print(f"  {Colors.DIM}Effort:{Colors.RESET}     {Colors.GREEN}{runtime_settings['effort_level']}{Colors.RESET}")
