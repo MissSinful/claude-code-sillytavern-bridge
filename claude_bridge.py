@@ -2163,9 +2163,23 @@ Image files to view:
         "--tools", tools_arg,
     ]
 
-    # Add core identity as system prompt to override Claude Code's default
+    # Add core identity as system prompt via file rather than inline argv.
+    # Windows caps the total command line at ~32K chars (CreateProcessW
+    # limit); a user pasting a long custom prompt into the System Prompt
+    # tab will hit that limit and get a cryptic subprocess failure.
+    # `--system-prompt-file <path>` takes an arbitrarily large file, so we
+    # write a temp file and pass its absolute path. The file is added to
+    # temp_files for cleanup in the finally block.
     if core_identity:
-        cmd.extend(["--system-prompt", core_identity])
+        sp_file = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt", delete=False
+        )
+        try:
+            sp_file.write(core_identity)
+        finally:
+            sp_file.close()
+        temp_files.append(sp_file)
+        cmd.extend(["--system-prompt-file", os.path.abspath(sp_file.name)])
 
     if all_image_paths:
         log(f"Images detected: {len(all_image_paths)} — enabling Read tool", "SUCCESS")
