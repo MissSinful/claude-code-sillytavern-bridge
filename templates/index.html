@@ -384,6 +384,12 @@
             color: var(--ink);
         }
 
+        .toggle-btn.disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
         /* ========== SWITCHES (minimal marks) ========== */
         .switch-container {
             display: flex;
@@ -898,6 +904,9 @@
                         <button class="toggle-btn" data-setting="effort" data-value="xhigh">xHigh</button>
                         <button class="toggle-btn" data-setting="effort" data-value="max">Max</button>
                     </div>
+                    <p id="effortSonnetNote" style="display:none;color:var(--warn,#d4a15a);font-size:11px;margin-top:8px;line-height:1.4;">
+                        <strong>Sonnet cap:</strong> High / xHigh / Max are disabled for Sonnet — at those levels it spends so long reasoning that it emits thinking only (or nothing) and never gets to the narrative. Medium and Low are the usable range for Sonnet. Opus supports the full range.
+                    </p>
                 </div>
 
                 <div class="setting-card">
@@ -1326,12 +1335,56 @@
             }
         }
 
+        // Sonnet produces thinking-only (or no) output at effort >= high.
+        // See backend clamp in claude_bridge.py. Here we mirror that in the
+        // UI by disabling high / xhigh / max whenever Sonnet is the active
+        // model, and bumping any existing selection in that range down to
+        // medium automatically.
+        const SONNET_DISABLED_EFFORTS = new Set(['high', 'xhigh', 'max']);
+
+        function updateEffortAvailability() {
+            const activeModel = document.querySelector('[data-setting="model"].active');
+            const model = activeModel ? activeModel.dataset.value : 'opus';
+            const isSonnet = (model === 'sonnet');
+
+            // Toggle disabled state on the high/xhigh/max buttons.
+            document.querySelectorAll('[data-setting="effort"]').forEach(btn => {
+                if (SONNET_DISABLED_EFFORTS.has(btn.dataset.value)) {
+                    btn.classList.toggle('disabled', isSonnet);
+                }
+            });
+
+            // Show the explanatory note only when Sonnet is selected.
+            const note = document.getElementById('effortSonnetNote');
+            if (note) note.style.display = isSonnet ? 'block' : 'none';
+
+            // If Sonnet is now active and the selected effort is one of the
+            // disabled ones, bump it down to medium so a saved setting from
+            // when Opus was selected doesn't silently send unsupported input.
+            if (isSonnet) {
+                const activeEffort = document.querySelector('[data-setting="effort"].active');
+                if (activeEffort && SONNET_DISABLED_EFFORTS.has(activeEffort.dataset.value)) {
+                    activeEffort.classList.remove('active');
+                    const mediumBtn = document.querySelector('[data-setting="effort"][data-value="medium"]');
+                    if (mediumBtn) mediumBtn.classList.add('active');
+                }
+            }
+        }
+
         // Toggle buttons (auto-save on click)
         document.querySelectorAll('.toggle-btn').forEach(btn => {
             btn.addEventListener('click', () => {
+                // Disabled buttons shouldn't do anything. pointer-events:none
+                // handles the common case but this guards against synthetic
+                // clicks and keyboard activation too.
+                if (btn.classList.contains('disabled')) return;
                 const setting = btn.dataset.setting;
                 document.querySelectorAll(`[data-setting="${setting}"]`).forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
+                // When the model changes, re-evaluate which effort levels
+                // are usable before saving — otherwise we'd persist an
+                // unsupported model+effort combo.
+                if (setting === 'model') updateEffortAvailability();
                 saveSettings(); // Auto-save when toggled
             });
         });
@@ -1440,6 +1493,10 @@
                 document.querySelectorAll('[data-setting="effort"]').forEach(btn => {
                     btn.classList.toggle('active', btn.dataset.value === settings.effort_level);
                 });
+                // After applying model + effort, disable Sonnet-incompatible
+                // effort levels (and bump if needed) so the UI matches the
+                // backend clamp from the first paint.
+                updateEffortAvailability();
                 document.querySelectorAll('[data-setting="creativity"]').forEach(btn => {
                     btn.classList.toggle('active', btn.dataset.value === (settings.creativity || 'balanced'));
                 });

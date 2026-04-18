@@ -2070,12 +2070,24 @@ Image files to view:
     # Enable Read tool if images were sent so Claude can view them
     tools_arg = "Read" if all_image_paths else ""
 
+    # Sonnet produces thinking-only or no output at effort levels above
+    # medium for non-trivial RP prompts (reproducibly, across users and
+    # non-explicit content). Exact cause is unclear — could be a CLI quirk
+    # around high-effort budgets on Sonnet — but empirically medium and
+    # below are the only levels that reliably emit narrative. Clamp here so
+    # users can leave effort at max globally without silently breaking
+    # every Sonnet request.
+    effort = runtime_settings["effort_level"]
+    if runtime_settings["model"] == "sonnet" and effort in ("high", "xhigh", "max"):
+        log(f"Clamping effort {effort} → medium (Sonnet produces no narrative above medium)", "WARN")
+        effort = "medium"
+
     cmd = [
         CLAUDE_EXE,
         "-p",
         "--output-format", "stream-json",
         "--verbose",
-        "--effort", runtime_settings["effort_level"],
+        "--effort", effort,
         "--model", runtime_settings["model"],
         "--tools", tools_arg,
     ]
@@ -2089,7 +2101,7 @@ Image files to view:
         for img_path in all_image_paths:
             log(f"  → {img_path}", "INFO")
 
-    log(f"Calling Claude ({runtime_settings['model']}, effort={runtime_settings['effort_level']})...", "INFO")
+    log(f"Calling Claude ({runtime_settings['model']}, effort={effort})...", "INFO")
     start_time = time.time()
 
     try:
