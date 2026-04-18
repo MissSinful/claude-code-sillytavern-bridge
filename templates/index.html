@@ -780,7 +780,7 @@
                 <dd>Point SillyTavern's OpenAI-compatible API at <code>http://localhost:5001/v1</code>. Any API key string works — the bridge doesn't check.</dd>
 
                 <dt>Model</dt>
-                <dd>SillyTavern's model selector is ignored. Choose Opus or Sonnet in the Settings tab instead.</dd>
+                <dd>SillyTavern's model selector is ignored. Choose Opus, Opus 4.6, or Sonnet in the Settings tab instead.</dd>
 
                 <dt>Start command</dt>
                 <dd>Run <code>run_bridge.bat</code> (or <code>python claude_bridge.py</code>) and keep the terminal visible — structured logs appear there while the bridge is running.</dd>
@@ -880,9 +880,10 @@
             <div class="settings-grid">
                 <div class="setting-card">
                     <h3>Model</h3>
-                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Opus = most capable, Sonnet = faster</p>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Opus = latest (4.7), most capable · Opus 4.6 = prior Opus, faster output · Sonnet = fastest</p>
                     <div class="toggle-group">
                         <button class="toggle-btn active" data-setting="model" data-value="opus">Opus</button>
+                        <button class="toggle-btn" data-setting="model" data-value="claude-opus-4-6">Opus 4.6</button>
                         <button class="toggle-btn" data-setting="model" data-value="sonnet">Sonnet</button>
                     </div>
                 </div>
@@ -894,6 +895,8 @@
                         <button class="toggle-btn" data-setting="effort" data-value="low">Low</button>
                         <button class="toggle-btn" data-setting="effort" data-value="medium">Medium</button>
                         <button class="toggle-btn active" data-setting="effort" data-value="high">High</button>
+                        <button class="toggle-btn" data-setting="effort" data-value="xhigh">xHigh</button>
+                        <button class="toggle-btn" data-setting="effort" data-value="max">Max</button>
                     </div>
                 </div>
 

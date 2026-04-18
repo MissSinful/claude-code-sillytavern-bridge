@@ -1586,7 +1586,7 @@ CORS(app)  # Enable CORS for SillyTavern
 # CONFIGURATION - Edit these settings as needed
 # =============================================================================
 
-DEFAULT_MODEL = "claude-opus-4-5-20251101"  # Model name to report
+DEFAULT_MODEL = "claude-opus-4-7"  # Model name to report
 
 # Default bridge system prompt. Single source of truth for both the request
 # handler (via runtime_settings.system_prompt_override fallback) and the GUI
@@ -1645,8 +1645,9 @@ Follow any structured thinking formats or protocols in the system prompt precise
 CRITICAL THINKING/PLANNING RULE: ALL planning, reasoning, context notes, character tracking, social dynamics, and internal analysis MUST go inside <think></think> tags. Do NOT close the </think> tag until ALL of your thinking is complete. If your system prompt defines structured sections like [Tools], [Context], [Social], etc., ALL of those sections must be inside a SINGLE <think> block. After you close </think>, your ENTIRE output must be pure narrative/roleplay - zero planning, zero meta-commentary, zero structured notes. If it's not dialogue or narration, it belongs inside <think>."""
 
 
-# Effort level: "low", "medium", or "high"
-# Higher effort = more thinking/reasoning
+# Effort level: "low", "medium", "high", "xhigh", or "max"
+# xhigh and max require Opus 4.7; on older models Claude Code falls back
+# to the highest supported level at or below the requested one.
 EFFORT_LEVEL = "high"
 
 # Show thinking in console output
@@ -1670,7 +1671,7 @@ runtime_settings = {
     "debug_output": DEBUG_RAW_OUTPUT,
     # Simple chunking toggle (one-shot)
     "chunking_enabled": False,
-    # Model selection: "opus" or "sonnet"
+    # Model selection: "opus" (latest, 4.7), "claude-opus-4-6" (prior Opus), or "sonnet"
     "model": "opus",
     # Tool calling support for extensions like TunnelVision
     "tool_calling_enabled": True,
