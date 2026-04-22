@@ -883,6 +883,15 @@
 
         <!-- Settings Panel -->
         <div id="settings" class="panel">
+            <div id="versionBanner" style="margin-bottom:18px;padding:10px 14px;background:var(--ink-sunk);border:1px solid var(--rule);font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                <div>
+                    <span style="color:var(--paper-faint);">Bridge version</span>
+                    <span id="versionCurrent" style="color:var(--paper);font-family:var(--font-mono);margin-left:6px;">—</span>
+                    <span id="versionStatus" style="color:var(--paper-ghost);margin-left:10px;">checking…</span>
+                </div>
+                <a id="versionReleaseLink" href="#" target="_blank" rel="noopener noreferrer" style="display:none;color:var(--accent);text-decoration:underline;font-family:var(--font-mono);">View release →</a>
+            </div>
+
             <div class="settings-grid">
                 <div class="setting-card">
                     <h3>Model</h3>
@@ -995,6 +1004,18 @@
                             <span class="slider"></span>
                         </label>
                         <span id="cliSessionReuseStatus">Enabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Update Check</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Check GitHub for new releases on startup. One unauthenticated API call. Non-blocking, logs a warning if outdated. No auto-install.</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="updateCheck" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span id="updateCheckStatus">Enabled</span>
                     </div>
                 </div>
             </div>
@@ -1422,6 +1443,10 @@
             document.getElementById('cliSessionReuseStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
             saveSettings();
         });
+        document.getElementById('updateCheck').addEventListener('change', function() {
+            document.getElementById('updateCheckStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
         document.getElementById('autoSummary').addEventListener('change', function() {
             const enabled = this.checked;
             document.getElementById('autoSummaryStatus').textContent = enabled ? 'Enabled' : 'Disabled';
@@ -1476,6 +1501,7 @@
                 debug_output: document.getElementById('debugOutput').checked,
                 tool_calling_enabled: document.getElementById('toolCalling').checked,
                 cli_session_reuse: document.getElementById('cliSessionReuse').checked,
+                update_check_enabled: document.getElementById('updateCheck').checked,
                 bridge_port: parseInt(document.getElementById('bridgePort').value, 10) || 5001,
                 simulated_streaming: document.querySelector('[data-setting="sim-stream"].active')?.dataset.value || 'natural'
             };
@@ -1494,6 +1520,54 @@
                 }
             } catch (e) {
                 alert('Error saving settings: ' + e.message);
+            }
+        }
+
+        // Populate the version banner from /api/version. The update check
+        // runs in a background thread on the server, so on first call the
+        // result may not be in yet — in that case we retry a couple of
+        // times with backoff and then give up quietly.
+        async function loadVersionInfo(retriesLeft = 2) {
+            try {
+                const resp = await fetch('/api/version');
+                if (!resp.ok) return;
+                const info = await resp.json();
+                const currentEl = document.getElementById('versionCurrent');
+                const statusEl = document.getElementById('versionStatus');
+                const linkEl = document.getElementById('versionReleaseLink');
+                if (info.current) currentEl.textContent = `v${info.current}`;
+
+                if (info.error) {
+                    statusEl.textContent = "(couldn't check for updates)";
+                    statusEl.style.color = 'var(--paper-ghost)';
+                    return;
+                }
+
+                if (info.latest) {
+                    if (info.update_available) {
+                        statusEl.textContent = `· update available: ${info.latest}`;
+                        statusEl.style.color = 'var(--warn, #d4a15a)';
+                        if (info.release_url) {
+                            linkEl.href = info.release_url;
+                            linkEl.style.display = 'inline';
+                        }
+                    } else {
+                        statusEl.textContent = '· up to date';
+                        statusEl.style.color = 'var(--paper-ghost)';
+                    }
+                    return;
+                }
+
+                // Result not in yet (background thread still running). Retry.
+                if (retriesLeft > 0) {
+                    setTimeout(() => loadVersionInfo(retriesLeft - 1), 2500);
+                } else {
+                    statusEl.textContent = '(check pending)';
+                    statusEl.style.color = 'var(--paper-ghost)';
+                }
+            } catch (e) {
+                // Silent — banner just stays blank. No one needs a red error
+                // for a nice-to-have check.
             }
         }
 
@@ -1538,6 +1612,11 @@
                 const cliSessionReuseEnabled = settings.cli_session_reuse !== false;
                 document.getElementById('cliSessionReuse').checked = cliSessionReuseEnabled;
                 document.getElementById('cliSessionReuseStatus').textContent = cliSessionReuseEnabled ? 'Enabled' : 'Disabled';
+
+                // Update check (default true — new setting)
+                const updateCheckEnabled = settings.update_check_enabled !== false;
+                document.getElementById('updateCheck').checked = updateCheckEnabled;
+                document.getElementById('updateCheckStatus').textContent = updateCheckEnabled ? 'Enabled' : 'Disabled';
 
                 // Bridge port — the first time we load, whatever comes back from
                 // the server IS the running port (since we're hitting the server
@@ -2305,6 +2384,7 @@
                 refreshLorebook(),
                 loadChatFiles(),
                 loadSummaryFileSelect(),
+                loadVersionInfo(),
             ]);
         })();
     </script>

@@ -18,9 +18,18 @@ import re
 import shutil
 import threading
 import queue
+import urllib.request
+import urllib.error
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, render_template
 from flask_cors import CORS
+
+# Bump this in the same commit you tag a new release. The update checker
+# compares it against the latest GitHub release tag and tells users when
+# they're behind. Keeping it in the source file (rather than deriving
+# from git) means it Just Works for users who download a zip instead of
+# cloning — no git metadata required at runtime.
+__version__ = "1.1.5"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -1793,6 +1802,11 @@ runtime_settings = {
     # to the unchanged-prefix portion of the payload — falls back to the
     # full-prompt path transparently. Disable if you see unexpected behavior.
     "cli_session_reuse": True,
+    # Check the bridge's GitHub releases on startup and warn if a newer
+    # version is available. Single unauthenticated API call, runs on a
+    # background thread so it never blocks startup. No auto-update — just
+    # a log line and a banner in the GUI.
+    "update_check_enabled": True,
 }
 
 # ============================================================================
@@ -1809,7 +1823,7 @@ PERSISTED_SETTING_KEYS = {
     "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold",
     "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name",
     "system_prompt_override", "creativity", "bridge_port", "simulated_streaming",
-    "cli_session_reuse",
+    "cli_session_reuse", "update_check_enabled",
 }
 
 
@@ -1958,6 +1972,88 @@ load_persisted_settings()
 
 
 # =============================================================================
+# UPDATE CHECKER
+# =============================================================================
+# Non-blocking check against GitHub releases. Fired once on startup in a
+# background thread so it never delays the bridge boot. Result is cached
+# in UPDATE_STATUS and surfaced via /api/version for the GUI to display.
+
+GITHUB_RELEASES_API = "https://api.github.com/repos/MissSinful/claude-code-sillytavern-bridge/releases/latest"
+
+UPDATE_STATUS = {
+    "current": __version__,
+    "latest": None,
+    "update_available": False,
+    "release_url": None,
+    "release_notes_preview": None,
+    "checked_at": None,
+    "error": None,
+}
+
+
+def _parse_version_tuple(v):
+    """Normalize 'v1.2.3' / '1.2.3' / '1.2.3-beta1' to a tuple for comparison.
+
+    Unparseable values collapse to (0,) so a valid release always beats
+    garbage input rather than throwing.
+    """
+    if not v:
+        return (0,)
+    v = v.lstrip("vV").strip()
+    # Strip pre-release suffix ("-beta1", "+build.2") before numeric parse.
+    head = re.split(r"[-+]", v, maxsplit=1)[0]
+    parts = head.split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return (0,)
+
+
+def _check_for_updates():
+    """Hit GitHub's latest-release endpoint, update UPDATE_STATUS.
+
+    Silent on failure — offline users and users behind restrictive firewalls
+    shouldn't see scary error messages for a nice-to-have feature. The error
+    is stored in UPDATE_STATUS so the GUI can show "couldn't check" if the
+    user cares, but nothing fires in the console.
+    """
+    try:
+        req = urllib.request.Request(
+            GITHUB_RELEASES_API,
+            headers={
+                "User-Agent": f"claude-code-sillytavern-bridge/{__version__}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest_tag = data.get("tag_name", "")
+        UPDATE_STATUS["latest"] = latest_tag
+        UPDATE_STATUS["release_url"] = data.get("html_url")
+        body = data.get("body") or ""
+        UPDATE_STATUS["release_notes_preview"] = body[:500] if body else None
+        UPDATE_STATUS["checked_at"] = time.time()
+        if _parse_version_tuple(latest_tag) > _parse_version_tuple(__version__):
+            UPDATE_STATUS["update_available"] = True
+            log(
+                f"Update available: {latest_tag} (you have v{__version__}) — "
+                f"{UPDATE_STATUS['release_url']}",
+                "WARN",
+            )
+        else:
+            UPDATE_STATUS["update_available"] = False
+            log(f"Bridge v{__version__} is up to date", "INFO")
+    except Exception as e:
+        UPDATE_STATUS["error"] = str(e)
+        UPDATE_STATUS["checked_at"] = time.time()
+        # Silent — don't spam the console for an optional check
+
+
+if runtime_settings.get("update_check_enabled", True):
+    threading.Thread(target=_check_for_updates, daemon=True).start()
+
+
+# =============================================================================
 # CLAUDE CLI SESSION PERSISTENCE (prompt-cache reuse across turns)
 # =============================================================================
 # The `claude` CLI keeps its own conversation state when invoked with
@@ -2033,30 +2129,63 @@ def _hash_system_messages(messages: list) -> str:
 
 
 def _extract_latest_user_text(messages: list) -> str:
-    """Return the final user message as plain text, for resumed payloads."""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        parts.append(part.get("text", ""))
-                return "\n".join(parts)
-            return str(content)
-    return ""
+    """Return all user-role messages after the last assistant message, joined.
+
+    Grabs the entire "new turn" rather than just the final user message.
+    SillyTavern presets often wrap each turn with multiple user-role
+    entries — e.g. Celia's <latest_turn_start> marker, the actual user
+    input, a <latest_turn_end> + context block, and a per-turn directive
+    ("Initiate the START of the next turn with..."). If we only forward
+    the last one, the CLI receives only the directive and Claude never
+    sees what the user actually typed, so it "continues where it left
+    off" instead of reacting to the new input. Joining everything since
+    the last assistant message matches what the full-prompt fallback
+    would have sent, so resume-path and non-resume-path behavior stay
+    semantically equivalent.
+    """
+    # Find index of the last assistant message. Everything after it is
+    # the new turn's worth of user content.
+    last_asst_idx = -1
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant":
+            last_asst_idx = i
+
+    parts = []
+    for msg in messages[last_asst_idx + 1:]:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+            content = "\n".join(text_parts)
+        parts.append(str(content))
+
+    return "\n\n".join(parts)
 
 
-def _decide_resume(messages: list) -> tuple:
+def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     """Return (char_key, session_id_or_None, reason).
 
     session_id_or_None is the CLI session to --resume, or None if we should
     fall back to the full-prompt path. `reason` is a short string for logs.
+
+    char_key_override lets the caller supply a char_key computed from the
+    ORIGINAL request messages, before auto-summary rebuilds the list.
+    Without this, the char_key we compute here hashes the first assistant
+    message of the REBUILT list (a mid-conversation response instead of
+    the greeting), which doesn't match the key the session was saved
+    under — so cache misses every turn once auto-summary is active.
     """
-    try:
-        char_key = get_character_key(messages)
-    except Exception as e:
-        return (None, None, f"char_key error: {e}")
+    if char_key_override:
+        char_key = char_key_override
+    else:
+        try:
+            char_key = get_character_key(messages)
+        except Exception as e:
+            return (None, None, f"char_key error: {e}")
 
     if not char_key or char_key == "default":
         return (char_key, None, "no stable character key")
@@ -2114,7 +2243,7 @@ def _update_session(char_key: str, session_id: str, messages: list):
 _load_sessions()
 
 
-def call_claude_code(messages: list, stream: bool = False, tools: list = None, stream_callback=None, process_holder: dict = None) -> dict:
+def call_claude_code(messages: list, stream: bool = False, tools: list = None, stream_callback=None, process_holder: dict = None, char_key: str = None) -> dict:
     """
     Call Claude Code CLI with the given messages.
     Converts OpenAI message format to a prompt for Claude.
@@ -2125,6 +2254,12 @@ def call_claude_code(messages: list, stream: bool = False, tools: list = None, s
     streaming generator) can kill the subprocess from outside if the client
     disconnects mid-response. Passing None (default) preserves the prior
     fire-and-forget behavior.
+
+    char_key: optional pre-computed character key. When auto-summary rebuilds
+    the messages list, the key computed from the rebuilt list will differ
+    from the key originally saved under. Callers that have access to the
+    original (pre-rebuild) messages should compute char_key there and pass
+    it in so session reuse correctly matches prior turns.
 
     If stream_callback is provided, it will be invoked with (kind, chunk)
     tuples as deltas arrive from the subprocess, where kind is "text" or
@@ -2328,7 +2463,7 @@ Image files to view:
     resume_session_id = None
     resume_reason = "disabled by setting"
     if runtime_settings.get("cli_session_reuse", True):
-        resume_char_key, resume_session_id, resume_reason = _decide_resume(messages)
+        resume_char_key, resume_session_id, resume_reason = _decide_resume(messages, char_key_override=char_key)
         if resume_session_id:
             if runtime_settings.get("debug_output"):
                 log(f"Resuming CLI session for [{resume_char_key}] ({resume_session_id[:8]}...): {resume_reason}", "INFO")
@@ -2647,7 +2782,11 @@ Image files to view:
         # here, so no stale session_id gets persisted.
         if captured_session_id:
             try:
-                persist_key = resume_char_key or get_character_key(messages)
+                # Prefer the caller-supplied char_key (computed from the
+                # original pre-rebuild messages). Fall back to the resume
+                # decision's key (also override-aware), and only as a last
+                # resort compute from the possibly-rebuilt messages here.
+                persist_key = char_key or resume_char_key or get_character_key(messages)
                 _update_session(persist_key, captured_session_id, messages)
             except Exception as e:
                 log(f"Could not persist CLI session: {e}", "WARN")
@@ -2845,7 +2984,7 @@ def _sse_delta(response_id: str, delta: dict, finish_reason=None) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-def generate_stream_response(messages: list, tools: list = None):
+def generate_stream_response(messages: list, tools: list = None, char_key: str = None):
     """
     Generate a real-time streaming response in OpenAI SSE format.
 
@@ -2866,7 +3005,7 @@ def generate_stream_response(messages: list, tools: list = None):
     # Tool-calling mode: parse_tool_calls needs the full response text, so
     # we can't meaningfully stream. Use the buffered simulated path.
     if tools:
-        result = call_claude_code(messages, tools=tools)
+        result = call_claude_code(messages, tools=tools, char_key=char_key)
         response_text = result["response"]
         thinking_text = result.get("thinking")
         if runtime_settings["include_thinking"] and thinking_text:
@@ -2894,7 +3033,7 @@ def generate_stream_response(messages: list, tools: list = None):
 
     def worker():
         try:
-            result = call_claude_code(messages, stream_callback=on_chunk, process_holder=process_holder)
+            result = call_claude_code(messages, stream_callback=on_chunk, process_holder=process_holder, char_key=char_key)
             worker_result["result"] = result
         except Exception as e:
             worker_result["error"] = str(e)
@@ -3050,6 +3189,17 @@ def chat_completions():
 
         # Store messages for potential deep analysis later
         LAST_MESSAGES_FOR_ANALYSIS["messages"] = messages.copy()
+
+        # Compute the character key ONCE, from the original request messages,
+        # before any auto-summary rebuild. Recomputing from the rebuilt list
+        # would hash a mid-conversation assistant response as the "first
+        # substantive assistant" instead of the character's greeting,
+        # producing a different key than what the session was stored under
+        # — so cache reuse would miss every turn once summary is active.
+        try:
+            original_char_key = get_character_key(messages)
+        except Exception:
+            original_char_key = None
 
         # Auto-summary mode - incremental summarization
         if runtime_settings.get("auto_summary_enabled", False) and not runtime_settings.get("chunking_enabled", False):
@@ -3267,7 +3417,7 @@ Now, based on this context, please respond to the following request:
                 # Trigger background lorebook analysis (starts in background thread)
                 trigger_lorebook_analysis(messages)
                 return Response(
-                    generate_stream_response(messages, tools=tools),
+                    generate_stream_response(messages, tools=tools, char_key=original_char_key),
                     mimetype="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -3298,7 +3448,7 @@ Now, based on this context, please respond to the following request:
         def worker():
             try:
                 result_holder["result"] = call_claude_code(
-                    messages, tools=tools, process_holder=process_holder
+                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key
                 )
             except Exception as e:
                 log(f"Non-streaming worker crashed: {e}", "ERROR")
@@ -3455,6 +3605,12 @@ def get_default_system_prompt():
     return jsonify({"default_system_prompt": DEFAULT_BRIDGE_SYSTEM_PROMPT})
 
 
+@app.route("/api/version", methods=["GET"])
+def get_version():
+    """Return bridge version + latest-release info for the GUI update banner."""
+    return jsonify(UPDATE_STATUS)
+
+
 @app.route("/api/settings", methods=["POST"])
 def update_settings():
     """Update runtime settings."""
@@ -3469,7 +3625,7 @@ def update_settings():
         runtime_settings["chunking_enabled"] = new_val
         log(f"CHUNKING: {old_val} -> {new_val}")
 
-    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "simulated_streaming", "cli_session_reuse"]:
+    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "simulated_streaming", "cli_session_reuse", "update_check_enabled"]:
         if key in data:
             # Coerce bridge_port to int and bounds-check. Invalid values are rejected.
             if key == "bridge_port":
