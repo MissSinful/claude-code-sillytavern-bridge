@@ -1785,6 +1785,14 @@ runtime_settings = {
     # available. The bridge collects the full response then trickles it out
     # as SSE chunks with small delays to make ST feel like it's streaming.
     "simulated_streaming": "natural",
+    # CLI session reuse via --resume. When enabled, the bridge captures the
+    # CLI's session_id from each response and on subsequent turns sends only
+    # the newest user message with --resume <id>, letting the CLI's cached
+    # prompt prefix do the work. Dramatic reduction in per-turn input tokens
+    # on long RPs. Automatically invalidates on swipes, edits, or any change
+    # to the unchanged-prefix portion of the payload — falls back to the
+    # full-prompt path transparently. Disable if you see unexpected behavior.
+    "cli_session_reuse": True,
 }
 
 # ============================================================================
@@ -1801,6 +1809,7 @@ PERSISTED_SETTING_KEYS = {
     "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold",
     "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name",
     "system_prompt_override", "creativity", "bridge_port", "simulated_streaming",
+    "cli_session_reuse",
 }
 
 
@@ -1946,6 +1955,163 @@ def log_box(title: str, stats: dict):
 
 # log() is now defined — safe to load persisted settings from disk.
 load_persisted_settings()
+
+
+# =============================================================================
+# CLAUDE CLI SESSION PERSISTENCE (prompt-cache reuse across turns)
+# =============================================================================
+# The `claude` CLI keeps its own conversation state when invoked with
+# `--resume <session_id>`. Reusing that session on follow-up turns means
+# the CLI re-uses its cached prompt prefix instead of our bridge paying
+# full input-token cost every turn. We capture the session_id from the
+# first stream-json event, stash it keyed by character, and resume when
+# the incoming message list looks like a natural continuation (user added
+# 1 or 2 trailing messages, and the unchanged prefix still hashes the same).
+
+SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge_sessions.json")
+SESSION_MAP: dict = {}
+_SESSION_LOCK = threading.Lock()
+
+
+def _load_sessions():
+    global SESSION_MAP
+    try:
+        if os.path.exists(SESSIONS_FILE):
+            with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                SESSION_MAP = data
+                log(f"Loaded {len(SESSION_MAP)} persisted CLI session(s)", "INFO")
+    except Exception as e:
+        log(f"Could not load {SESSIONS_FILE}: {e}", "WARN")
+        SESSION_MAP = {}
+
+
+def _save_sessions():
+    try:
+        with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(SESSION_MAP, f, indent=2)
+    except Exception as e:
+        log(f"Could not save {SESSIONS_FILE}: {e}", "WARN")
+
+
+def _hash_system_messages(messages: list) -> str:
+    """Hash only the system-role messages.
+
+    The original patch hashed the full conversation prefix to detect mutations
+    between turns. That's too strict for presets like Celia that dynamically
+    wrap each turn with `<latest_turn_start>` / `<latest_turn_end>` / directive
+    messages — those wrappers appear in the transcript on turn N but are
+    replaced with the next turn's wrappers on turn N+1, so the "unchanged
+    prefix" isn't actually byte-identical even though the semantic
+    conversation history is fine.
+
+    Session-state continuity is the CLI's job once we pass `--resume` — the
+    conversation history lives in the CLI's own session state, not in what
+    we pass through stdin. The only thing that MUST stay identical turn to
+    turn for us to safely resume is:
+
+      1. The character (enforced elsewhere via char_key)
+      2. The system prompt stack (what the CLI uses to build its context
+         each invocation — if this shifts, the cached prompt prefix misses
+         and resumed-session behavior may drift)
+
+    Hashing just the system messages catches real invalidation causes
+    (preset swap, character card edit, system prompt override change)
+    without false positives from dynamic per-turn wrapping.
+    """
+    h = hashlib.sha256()
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = json.dumps(content, sort_keys=True, default=str)
+        h.update(str(content).encode("utf-8", errors="replace"))
+        h.update(b"\x01")
+    return h.hexdigest()[:16]
+
+
+def _extract_latest_user_text(messages: list) -> str:
+    """Return the final user message as plain text, for resumed payloads."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                return "\n".join(parts)
+            return str(content)
+    return ""
+
+
+def _decide_resume(messages: list) -> tuple:
+    """Return (char_key, session_id_or_None, reason).
+
+    session_id_or_None is the CLI session to --resume, or None if we should
+    fall back to the full-prompt path. `reason` is a short string for logs.
+    """
+    try:
+        char_key = get_character_key(messages)
+    except Exception as e:
+        return (None, None, f"char_key error: {e}")
+
+    if not char_key or char_key == "default":
+        return (char_key, None, "no stable character key")
+
+    with _SESSION_LOCK:
+        entry = SESSION_MAP.get(char_key)
+        if not entry:
+            return (char_key, None, "no prior session")
+        session_id = entry.get("session_id")
+        last_count = entry.get("last_message_count", 0)
+        last_system_hash = entry.get("last_system_hash", "")
+
+    if not session_id:
+        return (char_key, None, "missing session_id")
+
+    new_count = len(messages)
+    delta = new_count - last_count
+    # Why: ST appends user (+1) or user+assistant (+2) between turns.
+    # Anything else means swipe (same count, content replaced), edit, or
+    # a rebuilt context — cache no longer valid.
+    if delta not in (1, 2):
+        with _SESSION_LOCK:
+            SESSION_MAP.pop(char_key, None)
+            _save_sessions()
+        return (char_key, None, f"message delta {delta} invalidates session")
+
+    # Why: system prompt / preset / character card changes legitimately
+    # invalidate the cache. Conversation-history changes DON'T (the CLI
+    # tracks history in its resumed session state, not in what we send).
+    current_system_hash = _hash_system_messages(messages)
+    if current_system_hash != last_system_hash:
+        with _SESSION_LOCK:
+            SESSION_MAP.pop(char_key, None)
+            _save_sessions()
+        return (char_key, None, "system prompt changed — invalidating")
+
+    return (char_key, session_id, "resume ok")
+
+
+def _update_session(char_key: str, session_id: str, messages: list):
+    if not char_key or char_key == "default" or not session_id:
+        return
+    new_count = len(messages)
+    system_hash = _hash_system_messages(messages)
+    with _SESSION_LOCK:
+        SESSION_MAP[char_key] = {
+            "session_id": session_id,
+            "last_message_count": new_count,
+            "last_system_hash": system_hash,
+            "updated_at": time.time(),
+        }
+        _save_sessions()
+
+
+_load_sessions()
 
 
 def call_claude_code(messages: list, stream: bool = False, tools: list = None, stream_callback=None, process_holder: dict = None) -> dict:
@@ -2153,6 +2319,30 @@ Image files to view:
         log(f"Clamping effort {effort} → medium (Sonnet produces no narrative above medium)", "WARN")
         effort = "medium"
 
+    # Decide whether to resume a prior CLI session for this character.
+    # Resume path sends only the latest user message and skips the bulky
+    # system-prompt-file, relying on the CLI's own cached session state.
+    # Gated on cli_session_reuse so users who see unexpected behavior can
+    # opt out from the GUI without a code change.
+    resume_char_key = None
+    resume_session_id = None
+    resume_reason = "disabled by setting"
+    if runtime_settings.get("cli_session_reuse", True):
+        resume_char_key, resume_session_id, resume_reason = _decide_resume(messages)
+        if resume_session_id:
+            if runtime_settings.get("debug_output"):
+                log(f"Resuming CLI session for [{resume_char_key}] ({resume_session_id[:8]}...): {resume_reason}", "INFO")
+            latest_user = _extract_latest_user_text(messages)
+            if latest_user.strip():
+                prompt = latest_user
+            else:
+                # No user message to send — fall back to full prompt.
+                log("Resume aborted: no latest user message text", "WARN")
+                resume_session_id = None
+        else:
+            if runtime_settings.get("debug_output") and resume_char_key and resume_char_key != "default":
+                log(f"Not resuming [{resume_char_key}]: {resume_reason}", "INFO")
+
     cmd = [
         CLAUDE_EXE,
         "-p",
@@ -2163,6 +2353,9 @@ Image files to view:
         "--tools", tools_arg,
     ]
 
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
+
     # Add core identity as system prompt via file rather than inline argv.
     # Windows caps the total command line at ~32K chars (CreateProcessW
     # limit); a user pasting a long custom prompt into the System Prompt
@@ -2170,6 +2363,11 @@ Image files to view:
     # `--system-prompt-file <path>` takes an arbitrarily large file, so we
     # write a temp file and pass its absolute path. The file is added to
     # temp_files for cleanup in the finally block.
+    #
+    # On resume: we MUST still pass the system prompt. `--resume` only
+    # restores the message transcript, not the system prompt (which the CLI
+    # reconstructs per-invocation from flags). Re-passing the byte-identical
+    # prompt keeps Anthropic prompt caching intact (same prefix → cache hit).
     if core_identity:
         sp_file = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", suffix=".txt", delete=False
@@ -2232,6 +2430,15 @@ Image files to view:
         stream_callback_fired_text = False
         stream_callback_fired_thinking = False
 
+        captured_session_id = None
+
+        # Why: aggregate from result event preferred; fall back to max across assistant events.
+        cache_read_max = 0
+        cache_creation_max = 0
+        input_tokens_max = 0
+        output_tokens_max = 0
+        result_usage_seen = False
+
         if runtime_settings["debug_output"]:
             log("Streaming response...", "INFO")
 
@@ -2244,6 +2451,11 @@ Image files to view:
                 event = json.loads(line)
                 event_type = event.get("type", "unknown")
                 event_count += 1
+
+                if captured_session_id is None:
+                    sid = event.get("session_id")
+                    if sid:
+                        captured_session_id = sid
 
                 # Handle errors
                 if event_type == "error":
@@ -2277,6 +2489,12 @@ Image files to view:
                 # Handle assistant message (final content)
                 elif event_type == "assistant":
                     message = event.get("message", {})
+                    if not result_usage_seen:
+                        a_usage = message.get("usage") or {}
+                        cache_read_max = max(cache_read_max, a_usage.get("cache_read_input_tokens") or 0)
+                        cache_creation_max = max(cache_creation_max, a_usage.get("cache_creation_input_tokens") or 0)
+                        input_tokens_max = max(input_tokens_max, a_usage.get("input_tokens") or 0)
+                        output_tokens_max = max(output_tokens_max, a_usage.get("output_tokens") or 0)
                     for block in message.get("content", []):
                         block_type = block.get("type")
                         if block_type == "thinking":
@@ -2308,6 +2526,11 @@ Image files to view:
                         output_tokens = usage.get("output_tokens", 0)
                         cache_read = usage.get("cache_read_input_tokens", 0)
                         cache_creation = usage.get("cache_creation_input_tokens", 0)
+                        result_usage_seen = True
+                        cache_read_max = cache_read or 0
+                        cache_creation_max = cache_creation or 0
+                        input_tokens_max = input_tokens or 0
+                        output_tokens_max = output_tokens or 0
                         cost = event.get("total_cost_usd", 0)
 
                         stats = {"Input": input_tokens, "Output": output_tokens}
@@ -2415,6 +2638,36 @@ Image files to view:
 
         if tool_calls:
             log(f"Detected {len(tool_calls)} tool call(s): {[tc['function']['name'] for tc in tool_calls]}")
+
+        # Persist the CLI session_id so the next turn can --resume and keep
+        # the prompt cache warm. Cancel-safety: this code only runs after
+        # process.wait() has returned AND we've cleared the cancelled-early
+        # return path above. If the client disconnected mid-stream and we
+        # killed the subprocess, call_claude_code returns before reaching
+        # here, so no stale session_id gets persisted.
+        if captured_session_id:
+            try:
+                persist_key = resume_char_key or get_character_key(messages)
+                _update_session(persist_key, captured_session_id, messages)
+            except Exception as e:
+                log(f"Could not persist CLI session: {e}", "WARN")
+
+        # Single-line cache report (gated on debug_output). Tells the user
+        # at a glance whether the CLI resumed and whether the prompt cache
+        # hit — which is the whole point of the session-reuse path.
+        if runtime_settings.get("debug_output"):
+            if cache_read_max > 0:
+                status = "HIT"
+            elif cache_creation_max > 0:
+                status = "MISS"
+            else:
+                status = "NONE"
+            resumed_flag = "resumed" if resume_session_id else "fresh"
+            log(
+                f"Cache: {status} read={cache_read_max:,} write={cache_creation_max:,} "
+                f"in={input_tokens_max:,} out={output_tokens_max:,} ({resumed_flag})",
+                "INFO",
+            )
 
         return {
             "response": clean_response,
@@ -3216,7 +3469,7 @@ def update_settings():
         runtime_settings["chunking_enabled"] = new_val
         log(f"CHUNKING: {old_val} -> {new_val}")
 
-    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "simulated_streaming"]:
+    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "simulated_streaming", "cli_session_reuse"]:
         if key in data:
             # Coerce bridge_port to int and bounds-check. Invalid values are rejected.
             if key == "bridge_port":

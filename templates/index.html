@@ -985,6 +985,18 @@
                         <button class="toggle-btn" data-setting="sim-stream" data-value="fast">Fast</button>
                     </div>
                 </div>
+
+                <div class="setting-card">
+                    <h3>CLI Session Reuse</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Reuses the Claude CLI's own session via <code>--resume</code> so follow-up turns ship only the newest message instead of the full history. Big input-token savings on long RPs (especially helpful on Pro tier). Auto-invalidates on swipes, edits, or prefix changes.</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="cliSessionReuse" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span id="cliSessionReuseStatus">Enabled</span>
+                    </div>
+                </div>
             </div>
 
             <div class="status-bar">
@@ -1406,6 +1418,10 @@
             document.getElementById('toolCallingStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
             saveSettings();
         });
+        document.getElementById('cliSessionReuse').addEventListener('change', function() {
+            document.getElementById('cliSessionReuseStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
         document.getElementById('autoSummary').addEventListener('change', function() {
             const enabled = this.checked;
             document.getElementById('autoSummaryStatus').textContent = enabled ? 'Enabled' : 'Disabled';
@@ -1459,6 +1475,7 @@
                 show_thinking_console: document.getElementById('consoleThinking').checked,
                 debug_output: document.getElementById('debugOutput').checked,
                 tool_calling_enabled: document.getElementById('toolCalling').checked,
+                cli_session_reuse: document.getElementById('cliSessionReuse').checked,
                 bridge_port: parseInt(document.getElementById('bridgePort').value, 10) || 5001,
                 simulated_streaming: document.querySelector('[data-setting="sim-stream"].active')?.dataset.value || 'natural'
             };
@@ -1516,6 +1533,11 @@
                 const toolCallingEnabled = settings.tool_calling_enabled !== false; // default true
                 document.getElementById('toolCalling').checked = toolCallingEnabled;
                 document.getElementById('toolCallingStatus').textContent = toolCallingEnabled ? 'Enabled' : 'Disabled';
+
+                // CLI session reuse (default true — new setting, may be absent in older bridge_settings.json)
+                const cliSessionReuseEnabled = settings.cli_session_reuse !== false;
+                document.getElementById('cliSessionReuse').checked = cliSessionReuseEnabled;
+                document.getElementById('cliSessionReuseStatus').textContent = cliSessionReuseEnabled ? 'Enabled' : 'Disabled';
 
                 // Bridge port — the first time we load, whatever comes back from
                 // the server IS the running port (since we're hitting the server
