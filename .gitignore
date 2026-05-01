@@ -2,6 +2,7 @@
 bridge_settings.json
 cache/
 temp_images/
+character_memory/
 
 # Claude Code's local session state (should never be committed)
 .claude/
@@ -41,3 +42,4 @@ desktop.ini
 g
 notes.md
 TODO.md
+MEMORY_DESIGN.md

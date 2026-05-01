@@ -764,7 +764,8 @@
             <button class="tab" data-num="III" onclick="showTab('system')">System Prompt</button>
             <button class="tab" data-num="IV" onclick="showTab('tools')">Tools</button>
             <button class="tab" data-num="V" onclick="showTab('lorebook')">Lorebook</button>
-            <button class="tab" data-num="VI" onclick="showTab('test')">Test</button>
+            <button class="tab" data-num="VI" onclick="showTab('memory')">Memory</button>
+            <button class="tab" data-num="VII" onclick="showTab('test')">Test</button>
         </nav>
 
         <!-- Welcome Panel -->
@@ -863,7 +864,7 @@
                 <dd>Extensions like TunnelVision route through the tool-calling toggle. Disable it if you're getting strange outputs or the extension is in an odd state.</dd>
 
                 <dt>Streaming</dt>
-                <dd>Currently buffered. The bridge waits for Claude's full response before returning to SillyTavern, even when ST requests streaming. Known limitation — on the list.</dd>
+                <dd>The bridge does not stream. The Claude Code CLI doesn't emit token deltas, so it has nothing to stream out — the bridge waits for Claude's full response and returns it in one payload. If ST requests <code>stream: true</code>, the response is wrapped in a single SSE chunk so the client still gets a valid event stream.</dd>
 
                 <dt>Chunking</dt>
                 <dd>One-shot by design: enable it, send one message, the bridge splits the conversation, summarizes every chunk, seeds the character's auto-summary bucket, and auto-disables. Use it after importing a long chat, not for every turn. The Cancel button disarms it without sending a request.</dd>
@@ -985,17 +986,6 @@
                 </div>
 
                 <div class="setting-card">
-                    <h3>Simulated Streaming</h3>
-                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Claude Code doesn't emit token deltas — the bridge paces the completed response through SSE so ST renders it progressively.</p>
-                    <div class="toggle-group">
-                        <button class="toggle-btn" data-setting="sim-stream" data-value="off">Off</button>
-                        <button class="toggle-btn" data-setting="sim-stream" data-value="slow">Slow</button>
-                        <button class="toggle-btn active" data-setting="sim-stream" data-value="natural">Natural</button>
-                        <button class="toggle-btn" data-setting="sim-stream" data-value="fast">Fast</button>
-                    </div>
-                </div>
-
-                <div class="setting-card">
                     <h3>CLI Session Reuse</h3>
                     <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Reuses the Claude CLI's own session via <code>--resume</code> so follow-up turns ship only the newest message instead of the full history. Big input-token savings on long RPs (especially helpful on Pro tier). Auto-invalidates on swipes, edits, or prefix changes.</p>
                     <div class="switch-container">
@@ -1004,6 +994,18 @@
                             <span class="slider"></span>
                         </label>
                         <span id="cliSessionReuseStatus">Enabled</span>
+                    </div>
+                </div>
+
+                <div class="setting-card">
+                    <h3>Character Memory</h3>
+                    <p style="color:var(--paper-faint);font-size:12px;margin-bottom:10px;">Structured per-character SQLite + embeddings + Sonnet librarian. Sonnet curates relevant memories before each Opus turn (~3-8s added latency) and updates the DB after (background, non-blocking). See <code>MEMORY_DESIGN.md</code> for the full architecture. Requires <code>sentence-transformers</code> (auto-installed via requirements.txt). First turn for a new character runs a one-time bootstrap pass (~5s). Old <code>state.md</code> / <code>diary.md</code> / <code>rules.md</code> files from the previous markdown-based system are migrated into the DB automatically on first enable.</p>
+                    <div class="switch-container">
+                        <label class="switch">
+                            <input type="checkbox" id="characterMemoryV2">
+                            <span class="slider"></span>
+                        </label>
+                        <span id="characterMemoryV2Status">Disabled</span>
                     </div>
                 </div>
 
@@ -1326,6 +1328,123 @@
         </div>
 
 
+        <!-- Memory Panel (Character Memory v2) -->
+        <div id="memory" class="panel">
+            <h3>Character Memory</h3>
+            <p style="color:var(--paper-faint);font-size:13px;">Inspect and edit the structured memory database for each character. Each row is a typed memory: desires, events, traits, relationships, secrets. Updates here are immediate — no bridge restart needed.</p>
+
+            <div class="setting-card" style="margin-top:16px;">
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <label style="font-family:var(--font-mono);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:var(--paper-faint);">Character:</label>
+                    <select id="memCharSelect" style="flex:1;min-width:240px;padding:10px 12px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:13px;">
+                        <option value="">— select a character —</option>
+                    </select>
+                    <button class="toggle-btn" id="memPinBtn">Pin</button>
+                    <button class="toggle-btn" id="memRefreshBtn">Refresh</button>
+                    <button class="toggle-btn" id="memResetBtn" style="border-color:var(--warn,#c44);color:var(--warn,#c44);">Reset</button>
+                </div>
+                <div id="memPinBanner" style="margin-top:10px;display:none;padding:8px 12px;background:var(--ink-sunk);border-left:3px solid var(--accent,#7aa);font-family:var(--font-mono);font-size:12px;">
+                    <span style="color:var(--paper-faint);text-transform:uppercase;letter-spacing:0.12em;font-size:10px;">Pinned:</span>
+                    <span id="memPinKey" style="color:var(--paper);"></span>
+                    <button class="toggle-btn" id="memUnpinBtn" style="margin-left:10px;padding:3px 10px;font-size:10px;">Unpin</button>
+                    <span style="color:var(--paper-faint);margin-left:8px;font-size:11px;">— bridge will use this key for every request, ignoring auto-detection.</span>
+                </div>
+                <div id="memCharSummary" style="margin-top:12px;color:var(--paper-faint);font-size:12px;font-family:var(--font-mono);"></div>
+            </div>
+
+            <div id="memBody" style="margin-top:16px;display:none;">
+                <!-- Sub-tab buttons -->
+                <div class="toggle-group" style="margin-bottom:12px;">
+                    <button class="toggle-btn active" data-memtab="memories">Memories</button>
+                    <button class="toggle-btn" data-memtab="needs">Needs</button>
+                    <button class="toggle-btn" data-memtab="npcs">NPCs</button>
+                    <button class="toggle-btn" data-memtab="seed">Card Seed</button>
+                    <button class="toggle-btn" data-memtab="errors">Errors</button>
+                </div>
+
+                <!-- Memories sub-panel -->
+                <div id="memSub_memories" class="memSubPanel">
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
+                        <label style="font-size:11px;color:var(--paper-faint);text-transform:uppercase;letter-spacing:0.12em;">Filter:</label>
+                        <select id="memFilterType" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+                            <option value="">all types</option>
+                        </select>
+                        <select id="memFilterStatus" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+                            <option value="active">active only</option>
+                            <option value="">all statuses</option>
+                            <option value="dormant">dormant</option>
+                            <option value="resolved">resolved</option>
+                            <option value="mutated">mutated</option>
+                            <option value="contradicted">contradicted</option>
+                        </select>
+                        <input id="memFilterText" type="text" placeholder="search content..." style="flex:1;min-width:160px;padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+                        <span id="memRowCount" style="color:var(--paper-faint);font-size:11px;font-family:var(--font-mono);"></span>
+                    </div>
+                    <div style="overflow-x:auto;border:1px solid var(--rule);">
+                        <table id="memTable" style="width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px;">
+                            <thead style="background:var(--ink-sunk);">
+                                <tr style="text-align:left;">
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">id</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">type</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">subj</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">int</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">imp</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">status</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">content</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">turn</th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="memTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Needs sub-panel -->
+                <div id="memSub_needs" class="memSubPanel" style="display:none;">
+                    <p style="color:var(--paper-faint);font-size:12px;">Higher = more satisfied. Lower = more pressure to act. Decay applies each turn.</p>
+                    <div id="memNeedsBody"></div>
+                    <button class="toggle-btn" id="memNeedsSaveBtn" style="margin-top:12px;">Save needs</button>
+                </div>
+
+                <!-- NPCs sub-panel -->
+                <div id="memSub_npcs" class="memSubPanel" style="display:none;">
+                    <div id="memNpcsBody"></div>
+                    <div id="memNpcDetail" style="margin-top:16px;display:none;">
+                        <h4 id="memNpcDetailTitle" style="font-family:var(--font-mono);"></h4>
+                        <div id="memNpcDetailMeta" style="color:var(--paper-faint);font-size:12px;font-family:var(--font-mono);margin-bottom:8px;"></div>
+                        <div style="overflow-x:auto;border:1px solid var(--rule);">
+                            <table style="width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px;">
+                                <thead style="background:var(--ink-sunk);">
+                                    <tr style="text-align:left;">
+                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">id</th>
+                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">type</th>
+                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">subj</th>
+                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">imp</th>
+                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">content</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="memNpcDetailRows"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Card Seed sub-panel -->
+                <div id="memSub_seed" class="memSubPanel" style="display:none;">
+                    <p style="color:var(--paper-faint);font-size:12px;">The raw bootstrap extraction from the character card, preserved for audit. Edits here are NOT applied to the DB; this is reference only.</p>
+                    <pre id="memSeedBody" style="background:var(--ink-sunk);padding:12px;border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;max-height:60vh;overflow:auto;"></pre>
+                </div>
+
+                <!-- Errors sub-panel -->
+                <div id="memSub_errors" class="memSubPanel" style="display:none;">
+                    <p style="color:var(--paper-faint);font-size:12px;">Tail of <code>sonnet_errors.log</code> for this character. Empty means no recent maintenance failures.</p>
+                    <pre id="memErrorsBody" style="background:var(--ink-sunk);padding:12px;border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;max-height:60vh;overflow:auto;"></pre>
+                </div>
+            </div>
+        </div>
+
+
         <!-- Test Panel -->
         <div id="test" class="panel">
             <h3>Test Message</h3>
@@ -1365,8 +1484,325 @@
                 refreshCache();
             } else if (tabName === 'lorebook') {
                 refreshLorebook();
+            } else if (tabName === 'memory') {
+                memLoadCharList();
             }
         }
+
+        // ===== Character Memory v2 GUI =====
+        let memCurrentChar = null;
+        let memCurrentData = null;
+
+        async function memLoadCharList() {
+            const resp = await fetch('/api/memory/list');
+            const data = await resp.json();
+            const sel = document.getElementById('memCharSelect');
+            const prev = sel.value;
+            sel.innerHTML = '<option value="">— select a character —</option>';
+            (data.characters || []).forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.char_key;
+                opt.textContent = `${c.char_key} (${c.memory_count} mem, ${c.npc_count} NPCs, turn ${c.latest_turn})`;
+                sel.appendChild(opt);
+            });
+            if (prev) {
+                sel.value = prev;
+                if (sel.value === prev) memLoadChar(prev);
+            }
+            await memRefreshPinBanner();
+        }
+
+        async function memRefreshPinBanner() {
+            try {
+                const resp = await fetch('/api/settings');
+                const settings = await resp.json();
+                const pinned = (settings.pinned_char_key || '').trim();
+                const banner = document.getElementById('memPinBanner');
+                const keyEl = document.getElementById('memPinKey');
+                if (pinned) {
+                    banner.style.display = 'block';
+                    keyEl.textContent = pinned;
+                } else {
+                    banner.style.display = 'none';
+                }
+            } catch (_) { /* ignore */ }
+        }
+
+        async function memPin() {
+            if (!memCurrentChar) {
+                alert('Select a character first, then click Pin.');
+                return;
+            }
+            const resp = await fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({pinned_char_key: memCurrentChar}),
+            });
+            if (resp.ok) memRefreshPinBanner();
+        }
+
+        async function memUnpin() {
+            const resp = await fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({pinned_char_key: ''}),
+            });
+            if (resp.ok) memRefreshPinBanner();
+        }
+
+        async function memLoadChar(charKey) {
+            if (!charKey) {
+                memCurrentChar = null;
+                memCurrentData = null;
+                document.getElementById('memBody').style.display = 'none';
+                document.getElementById('memCharSummary').textContent = '';
+                return;
+            }
+            const resp = await fetch('/api/memory/' + encodeURIComponent(charKey));
+            if (!resp.ok) {
+                document.getElementById('memCharSummary').textContent = 'Error: ' + resp.status;
+                return;
+            }
+            const data = await resp.json();
+            memCurrentChar = charKey;
+            memCurrentData = data;
+            document.getElementById('memBody').style.display = 'block';
+            const npcCount = (data.npcs || []).length;
+            const seedFlag = data.card_seed ? ' · seeded' : '';
+            document.getElementById('memCharSummary').textContent =
+                `${data.memories.length} memories · ${npcCount} NPCs · turn ${data.latest_turn}${seedFlag}`;
+
+            memPopulateTypeFilter(data.memories);
+            memRenderTable();
+            memRenderNeeds(data.needs);
+            memRenderNpcs(data.npcs);
+            memRenderSeed(data.card_seed);
+            memRenderErrors();
+        }
+
+        function memPopulateTypeFilter(memories) {
+            const types = Array.from(new Set(memories.map(m => m.type))).sort();
+            const sel = document.getElementById('memFilterType');
+            const prev = sel.value;
+            sel.innerHTML = '<option value="">all types</option>';
+            types.forEach(t => {
+                const opt = document.createElement('option');
+                opt.value = t;
+                opt.textContent = t;
+                sel.appendChild(opt);
+            });
+            sel.value = prev;
+        }
+
+        function memRenderTable() {
+            if (!memCurrentData) return;
+            const ftype = document.getElementById('memFilterType').value;
+            const fstatus = document.getElementById('memFilterStatus').value;
+            const ftext = document.getElementById('memFilterText').value.toLowerCase();
+            let rows = memCurrentData.memories.slice();
+            if (ftype) rows = rows.filter(r => r.type === ftype);
+            if (fstatus) rows = rows.filter(r => r.status === fstatus);
+            if (ftext) rows = rows.filter(r => (r.content || '').toLowerCase().includes(ftext));
+            // Sort: intensity desc, importance desc, id desc
+            rows.sort((a, b) => {
+                const ia = a.intensity || 0, ib = b.intensity || 0;
+                if (ib !== ia) return ib - ia;
+                if (b.importance !== a.importance) return b.importance - a.importance;
+                return b.id - a.id;
+            });
+            document.getElementById('memRowCount').textContent = `${rows.length} of ${memCurrentData.memories.length}`;
+            const tbody = document.getElementById('memTableBody');
+            tbody.innerHTML = '';
+            rows.forEach(r => {
+                const tr = document.createElement('tr');
+                tr.style.borderBottom = '1px solid var(--rule)';
+                if (r.status !== 'active') tr.style.opacity = '0.55';
+                tr.innerHTML = `
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.id}</td>
+                    <td style="padding:6px 8px;">${r.type}</td>
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.subject || '-'}</td>
+                    <td style="padding:6px 8px;">${r.intensity ?? ''}</td>
+                    <td style="padding:6px 8px;">${r.importance}</td>
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.status}</td>
+                    <td style="padding:6px 8px;">${escapeHtml(r.content || '')}</td>
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.created_turn}</td>
+                    <td style="padding:6px 8px;">
+                        <button class="toggle-btn" style="padding:3px 8px;font-size:10px;" onclick="memDeleteRow(${r.id})">×</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function escapeHtml(s) {
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        async function memDeleteRow(id) {
+            if (!confirm(`Delete memory row ${id}?`)) return;
+            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/row/${id}`, {method: 'DELETE'});
+            if (resp.ok) memLoadChar(memCurrentChar);
+        }
+
+        function memRenderNeeds(needs) {
+            const body = document.getElementById('memNeedsBody');
+            body.innerHTML = '';
+            if (!needs) {
+                body.textContent = '(no needs.json yet)';
+                return;
+            }
+            ['physical', 'social', 'emotional', 'custom'].forEach(cat => {
+                const slots = needs[cat] || {};
+                if (Object.keys(slots).length === 0 && cat === 'custom') return;
+                const h = document.createElement('div');
+                h.style.cssText = 'margin-top:14px;font-family:var(--font-mono);font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:var(--paper-faint);';
+                h.textContent = cat;
+                body.appendChild(h);
+                Object.entries(slots).forEach(([k, v]) => {
+                    const wrap = document.createElement('div');
+                    wrap.style.cssText = 'display:flex;align-items:center;gap:10px;margin:6px 0;';
+                    wrap.innerHTML = `
+                        <label style="min-width:140px;font-family:var(--font-mono);font-size:12px;">${k}</label>
+                        <input type="range" min="0" max="1" step="0.01" value="${v}" data-cat="${cat}" data-key="${k}" style="flex:1;">
+                        <span class="memNeedVal" data-cat="${cat}" data-key="${k}" style="min-width:40px;font-family:var(--font-mono);font-size:12px;">${Number(v).toFixed(2)}</span>
+                    `;
+                    body.appendChild(wrap);
+                });
+            });
+            // Live update of the displayed value
+            body.querySelectorAll('input[type=range]').forEach(inp => {
+                inp.addEventListener('input', () => {
+                    const span = body.querySelector(`.memNeedVal[data-cat="${inp.dataset.cat}"][data-key="${inp.dataset.key}"]`);
+                    if (span) span.textContent = Number(inp.value).toFixed(2);
+                });
+            });
+        }
+
+        async function memSaveNeeds() {
+            if (!memCurrentChar || !memCurrentData) return;
+            const needs = JSON.parse(JSON.stringify(memCurrentData.needs || {}));
+            document.querySelectorAll('#memNeedsBody input[type=range]').forEach(inp => {
+                const cat = inp.dataset.cat, k = inp.dataset.key;
+                if (!needs[cat]) needs[cat] = {};
+                needs[cat][k] = Number(inp.value);
+            });
+            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/needs`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(needs),
+            });
+            if (resp.ok) memLoadChar(memCurrentChar);
+        }
+
+        function memRenderNpcs(npcs) {
+            const body = document.getElementById('memNpcsBody');
+            body.innerHTML = '';
+            document.getElementById('memNpcDetail').style.display = 'none';
+            if (!npcs || npcs.length === 0) {
+                body.textContent = 'No NPCs registered yet.';
+                return;
+            }
+            npcs.forEach(n => {
+                const card = document.createElement('div');
+                card.className = 'setting-card';
+                card.style.cssText = 'cursor:pointer;margin-bottom:8px;';
+                card.innerHTML = `
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <div>
+                            <strong>${escapeHtml(n.name || n.npc_key)}</strong>
+                            <span style="color:var(--paper-faint);font-size:11px;font-family:var(--font-mono);margin-left:8px;">[${n.npc_key}]</span>
+                            <span style="color:var(--paper-faint);font-size:11px;margin-left:8px;">status: ${n.status || 'active'}, introduced turn ${n.introduced_at_turn ?? '?'}</span>
+                        </div>
+                        <span style="color:var(--paper-faint);font-size:11px;">click to inspect</span>
+                    </div>
+                    <div style="color:var(--paper-faint);font-size:12px;margin-top:6px;">${escapeHtml((n.bio || '').slice(0, 200))}${(n.bio || '').length > 200 ? '...' : ''}</div>
+                `;
+                card.onclick = () => memLoadNpc(n.npc_key);
+                body.appendChild(card);
+            });
+        }
+
+        async function memLoadNpc(npcKey) {
+            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/npc/${encodeURIComponent(npcKey)}`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const det = document.getElementById('memNpcDetail');
+            det.style.display = 'block';
+            document.getElementById('memNpcDetailTitle').textContent = `${data.card.name} [${npcKey}]`;
+            document.getElementById('memNpcDetailMeta').textContent =
+                `status: ${data.card.status}, introduced turn ${data.card.introduced_at_turn}, ${data.memories.length} memories, ${data.card.seeded ? 'seeded' : 'not seeded'}`;
+            const tbody = document.getElementById('memNpcDetailRows');
+            tbody.innerHTML = '';
+            data.memories.forEach(r => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.id}</td>
+                    <td style="padding:6px 8px;">${r.type}</td>
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.subject || '-'}</td>
+                    <td style="padding:6px 8px;">${r.importance}</td>
+                    <td style="padding:6px 8px;">${escapeHtml(r.content || '')}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function memRenderSeed(seed) {
+            const body = document.getElementById('memSeedBody');
+            body.textContent = seed ? JSON.stringify(seed, null, 2) : '(no card_seed.json — bootstrap may not have run yet)';
+        }
+
+        async function memRenderErrors() {
+            if (!memCurrentChar) return;
+            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/errors`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            document.getElementById('memErrorsBody').textContent = data.text || '(no errors logged)';
+        }
+
+        async function memReset() {
+            if (!memCurrentChar) return;
+            if (!confirm(`Wipe ALL memory for "${memCurrentChar}"? This deletes the DB, NPCs, needs, and card seed. Cannot be undone.`)) return;
+            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/reset`, {method: 'POST'});
+            if (resp.ok) {
+                memCurrentChar = null;
+                document.getElementById('memCharSelect').value = '';
+                memLoadCharList();
+                document.getElementById('memBody').style.display = 'none';
+                document.getElementById('memCharSummary').textContent = 'Reset complete.';
+            }
+        }
+
+        // Wire memory tab events
+        document.addEventListener('DOMContentLoaded', () => {
+            const sel = document.getElementById('memCharSelect');
+            if (sel) sel.addEventListener('change', e => memLoadChar(e.target.value));
+            const refresh = document.getElementById('memRefreshBtn');
+            if (refresh) refresh.addEventListener('click', () => memCurrentChar ? memLoadChar(memCurrentChar) : memLoadCharList());
+            const reset = document.getElementById('memResetBtn');
+            if (reset) reset.addEventListener('click', memReset);
+            const pin = document.getElementById('memPinBtn');
+            if (pin) pin.addEventListener('click', memPin);
+            const unpin = document.getElementById('memUnpinBtn');
+            if (unpin) unpin.addEventListener('click', memUnpin);
+            ['memFilterType', 'memFilterStatus', 'memFilterText'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.addEventListener('input', memRenderTable);
+            });
+            const saveNeedsBtn = document.getElementById('memNeedsSaveBtn');
+            if (saveNeedsBtn) saveNeedsBtn.addEventListener('click', memSaveNeeds);
+            // Sub-tab switching within Memory panel
+            document.querySelectorAll('[data-memtab]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('[data-memtab]').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    document.querySelectorAll('.memSubPanel').forEach(p => p.style.display = 'none');
+                    document.getElementById('memSub_' + btn.dataset.memtab).style.display = 'block';
+                });
+            });
+        });
 
         // Sonnet produces thinking-only (or no) output at effort >= high.
         // See backend clamp in claude_bridge.py. Here we mirror that in the
@@ -1443,6 +1879,10 @@
             document.getElementById('cliSessionReuseStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
             saveSettings();
         });
+        document.getElementById('characterMemoryV2').addEventListener('change', function() {
+            document.getElementById('characterMemoryV2Status').textContent = this.checked ? 'Enabled' : 'Disabled';
+            saveSettings();
+        });
         document.getElementById('updateCheck').addEventListener('change', function() {
             document.getElementById('updateCheckStatus').textContent = this.checked ? 'Enabled' : 'Disabled';
             saveSettings();
@@ -1501,9 +1941,9 @@
                 debug_output: document.getElementById('debugOutput').checked,
                 tool_calling_enabled: document.getElementById('toolCalling').checked,
                 cli_session_reuse: document.getElementById('cliSessionReuse').checked,
+                character_memory_v2_enabled: document.getElementById('characterMemoryV2').checked,
                 update_check_enabled: document.getElementById('updateCheck').checked,
                 bridge_port: parseInt(document.getElementById('bridgePort').value, 10) || 5001,
-                simulated_streaming: document.querySelector('[data-setting="sim-stream"].active')?.dataset.value || 'natural'
             };
 
             try {
@@ -1591,9 +2031,6 @@
                 document.querySelectorAll('[data-setting="creativity"]').forEach(btn => {
                     btn.classList.toggle('active', btn.dataset.value === (settings.creativity || 'balanced'));
                 });
-                document.querySelectorAll('[data-setting="sim-stream"]').forEach(btn => {
-                    btn.classList.toggle('active', btn.dataset.value === (settings.simulated_streaming || 'natural'));
-                });
                 document.getElementById('includeThinking').checked = settings.include_thinking;
                 document.getElementById('consoleThinking').checked = settings.show_thinking_console;
                 document.getElementById('debugOutput').checked = settings.debug_output;
@@ -1612,6 +2049,11 @@
                 const cliSessionReuseEnabled = settings.cli_session_reuse !== false;
                 document.getElementById('cliSessionReuse').checked = cliSessionReuseEnabled;
                 document.getElementById('cliSessionReuseStatus').textContent = cliSessionReuseEnabled ? 'Enabled' : 'Disabled';
+
+                // Character memory (default false — opt-in)
+                const characterMemoryV2Enabled = settings.character_memory_v2_enabled === true;
+                document.getElementById('characterMemoryV2').checked = characterMemoryV2Enabled;
+                document.getElementById('characterMemoryV2Status').textContent = characterMemoryV2Enabled ? 'Enabled' : 'Disabled';
 
                 // Update check (default true — new setting)
                 const updateCheckEnabled = settings.update_check_enabled !== false;

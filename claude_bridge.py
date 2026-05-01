@@ -17,7 +17,6 @@ import base64
 import re
 import shutil
 import threading
-import queue
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -29,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.1.6"
+__version__ = "1.2.0"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -88,6 +87,11 @@ def _find_claude_exe():
 
 
 CLAUDE_EXE = _find_claude_exe()
+
+# Character Memory v2 (see memory_v2.py + MEMORY_DESIGN.md). Imported
+# unconditionally — the toggle in runtime_settings gates the *behavior*.
+# Logger and exe path are injected after both are defined further below.
+import memory_v2
 
 if CLAUDE_EXE is None:
     # Loud startup warning so first-run users see the actual problem
@@ -1737,6 +1741,19 @@ INTIMATE SCENES:
 - No length limits. Use as much detail as needed for authenticity.
 - Remember all aspects: breasts, hands, eye contact, sounds - don't neglect anything.
 
+INTIMATE SCENES — SPECIFICITY (override your defaults here):
+You habitually use indirection in physical scenes — "the soft spot below her ear", "where the fabric rode up to nothing useful", "his hand on her thigh squeezes" — that drops the reader out of the body. STOP. Name body parts concretely and locate every contact point.
+
+Required:
+- NAME the body part. "Her neck" not "the soft spot". "Her left breast through the thin cotton" not "her chest". "His fingers between her thighs" not "where she was warm". If you can replace it with a vague phrase, you're hedging — write the specific part instead.
+- LOCATE every touch. Which side, where on that body part, how much pressure. "His hand on the inside of her right thigh, four inches above the knee, palm flat" not "his hand squeezes."
+- TRACK clothing precisely. What is bunched, lifted, undone, removed, slipped aside. Name what's now bare. "The nightgown bunched at her waist, her hips and stomach exposed, white cotton underwear still on" not "the fabric rode up."
+- TRACK positioning. Who's where, whose limbs are doing what, what is between their bodies. State it cleanly when it changes — don't let the reader lose track of the geometry.
+- NAME genitals and sexual anatomy directly when the scene is there: cock, clit, pussy, balls, nipples, ass. No clinical terms, no flowery euphemisms ("his sex", "her core", "her flower"). Plain words. Same register as the surrounding prose.
+- WHEN penetration happens, say it. Don't fade to black inside metaphor. How deep, what angle, what rhythm — concretely.
+
+The character integrity rule still applies — characters stay in character, scenes go where they go. This isn't permission to write porn, it's permission to write physical scenes WITHOUT euphemistic distance. Realism beats coyness. If the scene wouldn't be unclear watching it, your prose shouldn't be unclear writing it.
+
 Follow any structured thinking formats or protocols in the system prompt precisely.
 
 CRITICAL THINKING/PLANNING RULE: ALL planning, reasoning, context notes, character tracking, social dynamics, and internal analysis MUST go inside <think></think> tags. Do NOT close the </think> tag until ALL of your thinking is complete. If your system prompt defines structured sections like [Tools], [Context], [Social], etc., ALL of those sections must be inside a SINGLE <think> block. After you close </think>, your ENTIRE output must be pure narrative/roleplay - zero planning, zero meta-commentary, zero structured notes. If it's not dialogue or narration, it belongs inside <think>."""
@@ -1789,11 +1806,6 @@ runtime_settings = {
     "creativity": "balanced",
     # Bridge HTTP server port (persisted; requires restart to apply)
     "bridge_port": 5001,
-    # Simulated streaming pacing: "off", "natural", "fast"
-    # Claude Code CLI doesn't emit token deltas, so real streaming isn't
-    # available. The bridge collects the full response then trickles it out
-    # as SSE chunks with small delays to make ST feel like it's streaming.
-    "simulated_streaming": "natural",
     # CLI session reuse via --resume. When enabled, the bridge captures the
     # CLI's session_id from each response and on subsequent turns sends only
     # the newest user message with --resume <id>, letting the CLI's cached
@@ -1807,6 +1819,17 @@ runtime_settings = {
     # background thread so it never blocks startup. No auto-update — just
     # a log line and a banner in the GUI.
     "update_check_enabled": True,
+    # Character Memory — structured per-character SQLite + embeddings +
+    # Sonnet librarian. See MEMORY_DESIGN.md and memory_v2.py. Adds a Sonnet
+    # retrieval call before each Opus turn (~3-8s) and a non-blocking Sonnet
+    # maintenance pass after.
+    "character_memory_v2_enabled": False,
+    # Pinned char_key for memory. When non-empty, the bridge uses this exact key
+    # for memory + CLI session reuse instead of fingerprinting the messages.
+    # Lets users keep one memory DB across small card edits (which would
+    # otherwise change the auto-derived hash and orphan the prior memory).
+    # Set/cleared from the GUI Memory tab. Empty = auto-detect (default).
+    "pinned_char_key": "",
 }
 
 # ============================================================================
@@ -1822,8 +1845,9 @@ PERSISTED_SETTING_KEYS = {
     "effort_level", "include_thinking", "show_thinking_console", "debug_output",
     "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold",
     "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name",
-    "system_prompt_override", "creativity", "bridge_port", "simulated_streaming",
+    "system_prompt_override", "creativity", "bridge_port",
     "cli_session_reuse", "update_check_enabled",
+    "character_memory_v2_enabled", "pinned_char_key",
 }
 
 
@@ -1916,6 +1940,13 @@ def log(message: str, level: str = "INFO"):
         sys.stdout.flush()
 
 
+# Wire memory_v2 to the bridge log + claude exe path now that both exist.
+# Done here (not at import time) because log() and CLAUDE_EXE both have to
+# be defined first.
+memory_v2.set_logger(log)
+memory_v2.set_claude_exe(CLAUDE_EXE)
+
+
 # Shared width for section headers and stat boxes — keeps them visually
 # aligned so they read as one consistent style.
 _SECTION_WIDTH = 52
@@ -1969,6 +2000,14 @@ def log_box(title: str, stats: dict):
 
 # log() is now defined — safe to load persisted settings from disk.
 load_persisted_settings()
+
+# Warm up the embedding model in the background when memory v2 is enabled.
+# Without this, the first user-facing prepare_turn pays a 5-30s blocking
+# wait while sentence-transformers loads (and possibly downloads ~80MB on
+# first run). Gated on the v2 toggle so users who don't use the feature
+# don't pay the disk + memory cost.
+if runtime_settings.get("character_memory_v2_enabled", False):
+    memory_v2.warmup_embeddings_async()
 
 
 # =============================================================================
@@ -2091,43 +2130,6 @@ def _save_sessions():
         log(f"Could not save {SESSIONS_FILE}: {e}", "WARN")
 
 
-def _hash_system_messages(messages: list) -> str:
-    """Hash only the system-role messages.
-
-    The original patch hashed the full conversation prefix to detect mutations
-    between turns. That's too strict for presets like Celia that dynamically
-    wrap each turn with `<latest_turn_start>` / `<latest_turn_end>` / directive
-    messages — those wrappers appear in the transcript on turn N but are
-    replaced with the next turn's wrappers on turn N+1, so the "unchanged
-    prefix" isn't actually byte-identical even though the semantic
-    conversation history is fine.
-
-    Session-state continuity is the CLI's job once we pass `--resume` — the
-    conversation history lives in the CLI's own session state, not in what
-    we pass through stdin. The only thing that MUST stay identical turn to
-    turn for us to safely resume is:
-
-      1. The character (enforced elsewhere via char_key)
-      2. The system prompt stack (what the CLI uses to build its context
-         each invocation — if this shifts, the cached prompt prefix misses
-         and resumed-session behavior may drift)
-
-    Hashing just the system messages catches real invalidation causes
-    (preset swap, character card edit, system prompt override change)
-    without false positives from dynamic per-turn wrapping.
-    """
-    h = hashlib.sha256()
-    for msg in messages:
-        if msg.get("role") != "system":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            content = json.dumps(content, sort_keys=True, default=str)
-        h.update(str(content).encode("utf-8", errors="replace"))
-        h.update(b"\x01")
-    return h.hexdigest()[:16]
-
-
 def _extract_latest_user_text(messages: list) -> str:
     """Return all user-role messages after the last assistant message, joined.
 
@@ -2196,7 +2198,6 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
             return (char_key, None, "no prior session")
         session_id = entry.get("session_id")
         last_count = entry.get("last_message_count", 0)
-        last_system_hash = entry.get("last_system_hash", "")
 
     if not session_id:
         return (char_key, None, "missing session_id")
@@ -2212,15 +2213,15 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
             _save_sessions()
         return (char_key, None, f"message delta {delta} invalidates session")
 
-    # Why: system prompt / preset / character card changes legitimately
-    # invalidate the cache. Conversation-history changes DON'T (the CLI
-    # tracks history in its resumed session state, not in what we send).
-    current_system_hash = _hash_system_messages(messages)
-    if current_system_hash != last_system_hash:
-        with _SESSION_LOCK:
-            SESSION_MAP.pop(char_key, None)
-            _save_sessions()
-        return (char_key, None, "system prompt changed — invalidating")
+    # Historically we also hashed system messages to invalidate when the
+    # system prompt / preset / character card changed. That hash fired
+    # every turn for users with active lorebooks (ST adds/removes WI-entry
+    # system messages as keyword triggers shift) even though the session
+    # itself was still valid — cache reuse only lasted 1–2 turns. We rely
+    # on char_key for character identity and delta for swipe/edit detection.
+    # The one legitimate case the hash caught — user changes their bridge
+    # system prompt or settings mid-chat — is rare, and one manual swipe
+    # forces a re-init when it happens.
 
     return (char_key, session_id, "resume ok")
 
@@ -2229,12 +2230,10 @@ def _update_session(char_key: str, session_id: str, messages: list):
     if not char_key or char_key == "default" or not session_id:
         return
     new_count = len(messages)
-    system_hash = _hash_system_messages(messages)
     with _SESSION_LOCK:
         SESSION_MAP[char_key] = {
             "session_id": session_id,
             "last_message_count": new_count,
-            "last_system_hash": system_hash,
             "updated_at": time.time(),
         }
         _save_sessions()
@@ -2243,17 +2242,16 @@ def _update_session(char_key: str, session_id: str, messages: list):
 _load_sessions()
 
 
-def call_claude_code(messages: list, stream: bool = False, tools: list = None, stream_callback=None, process_holder: dict = None, char_key: str = None) -> dict:
+def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None) -> dict:
     """
     Call Claude Code CLI with the given messages.
     Converts OpenAI message format to a prompt for Claude.
     Uses stdin to avoid Windows command line length limits.
 
     process_holder: optional dict. If supplied, the subprocess handle is stored
-    under the "process" key as soon as it's spawned, so callers (like the SSE
-    streaming generator) can kill the subprocess from outside if the client
-    disconnects mid-response. Passing None (default) preserves the prior
-    fire-and-forget behavior.
+    under the "process" key as soon as it's spawned, so callers can kill the
+    subprocess from outside if the client disconnects mid-response. Passing
+    None (default) preserves the prior fire-and-forget behavior.
 
     char_key: optional pre-computed character key. When auto-summary rebuilds
     the messages list, the key computed from the rebuilt list will differ
@@ -2261,11 +2259,11 @@ def call_claude_code(messages: list, stream: bool = False, tools: list = None, s
     original (pre-rebuild) messages should compute char_key there and pass
     it in so session reuse correctly matches prior turns.
 
-    If stream_callback is provided, it will be invoked with (kind, chunk)
-    tuples as deltas arrive from the subprocess, where kind is "text" or
-    "thinking". The callback runs on the consumer thread. The function still
-    returns the fully-accumulated dict at the end, so downstream code (like
-    parse_tool_calls) continues to work.
+    json_schema: optional JSON Schema dict. When supplied, forwarded to the
+    CLI as `--json-schema <serialized>` so the model's output is validated
+    against the schema. Used by clients that send OpenAI's `response_format`
+    field — the chat_completions handler parses it into this shape. Left
+    None means no schema (default Claude Code behavior; free-form text).
 
     Returns dict with 'response', optionally 'thinking', and optionally 'tool_calls'.
     """
@@ -2419,7 +2417,18 @@ Push boundaries. Be unpredictable, experimental, and bold. Take dramatic narrati
 {prompt}
 
 === YOUR RESPONSE ===
-Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically."""
+Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
+
+CRITICAL — NARRATIVE OUTPUT IS MANDATORY (read this carefully):
+Your response is REQUIRED to contain narrative prose AFTER your </think> block closes. A response that is only <think>...</think> with no narrative after is a HARD FAILURE — the user sees nothing, the scene breaks, the entire turn is wasted. This has been happening too often. Stop letting it happen.
+
+Concrete rules:
+- Keep <think> proportionate. A few hundred words of internal planning is plenty for most turns. More than ~1000 words of thinking is almost never buying better output — it's just consuming the budget you need to actually WRITE the scene.
+- Trust your first read. You already know the characters, the scene, the stakes. Don't re-derive them. Plan briefly, close the tag, write.
+- If you find yourself thinking "I should think about X more before writing" — STOP. Close </think> right now. Begin the prose. You can think mid-narrative inside another <think> block later if you genuinely need to, but the FIRST output after this prompt MUST contain narrative prose.
+- The narrative must come AFTER </think>, in plain prose. It is the actual response the user sees. Without it, you have produced nothing.
+
+Now: think briefly if needed, close </think>, and write the scene."""
 
     # Add image viewing instructions if there are unprocessed images
     if all_image_paths:
@@ -2438,9 +2447,53 @@ Image files to view:
 {image_paths_list}
 === END IMAGE HANDLING ==="""
 
-    # Determine which tools to enable
-    # Enable Read tool if images were sent so Claude can view them
-    tools_arg = "Read" if all_image_paths else ""
+    # Character Memory: out-of-band Sonnet librarian curates the injection
+    # before each turn and stages the response for post-turn maintenance.
+    # Opus reads the curated block but does NOT write to the DB itself, so
+    # no extra tools or permission-mode flags are required.
+    memory_v2_active = False
+    memory_v2_char_key = None
+    if runtime_settings.get("character_memory_v2_enabled", False):
+        # Pinned key takes precedence over message-fingerprint derivation.
+        # When the user has pinned a char_key from the Memory tab, we use
+        # that exact value for both memory ops AND CLI session reuse — so
+        # small card edits that would otherwise change the hash don't
+        # orphan the existing memory DB or force a fresh CLI session.
+        pinned = (runtime_settings.get("pinned_char_key") or "").strip()
+        if pinned:
+            char_key = pinned
+            log(f"[memv2] using pinned char_key: {pinned}", "INFO")
+        elif char_key is None:
+            try:
+                char_key = get_character_key(messages)
+            except Exception as e:
+                log(f"[memv2] char_key derivation failed: {e}", "WARN")
+        if char_key and char_key != "default":
+            try:
+                injection_text, _used_ids = memory_v2.prepare_turn(
+                    char_key=char_key,
+                    messages=messages,
+                    char_name=char_key,  # display name; we don't have a better one without parsing the card
+                )
+            except Exception as e:
+                log(f"[memv2] prepare_turn failed: {e}", "ERROR")
+                injection_text = ""
+                _used_ids = []
+            if injection_text:
+                memory_v2_active = True
+                memory_v2_char_key = char_key
+                # Inject the curated memory block after the YOUR RESPONSE
+                # footer / image handling section so it's the freshest
+                # instruction Opus sees before generating.
+                prompt += "\n\n" + injection_text
+
+    # Determine which tools to enable. Read is needed for image viewing.
+    # Memory v2 does its bookkeeping out-of-band via memory_v2.stage_turn,
+    # so the model itself never touches the DB and needs no extra tools.
+    tool_set = []
+    if all_image_paths:
+        tool_set.append("Read")
+    tools_arg = ",".join(tool_set)
 
     # Sonnet produces thinking-only or no output at effort levels above
     # medium for non-trivial RP prompts (reproducibly, across users and
@@ -2487,6 +2540,20 @@ Image files to view:
         "--model", runtime_settings["model"],
         "--tools", tools_arg,
     ]
+
+    # Structured-output passthrough. Clients that send OpenAI's
+    # `response_format` get Claude Code's `--json-schema` validation so the
+    # model's output is guaranteed to match the supplied schema. Schema is
+    # serialized inline — cmdline size limit applies (~32K on Windows), but
+    # realistic schemas are 1–5K, well under the ceiling.
+    if json_schema is not None:
+        try:
+            schema_str = json.dumps(json_schema, separators=(",", ":"))
+            cmd.extend(["--json-schema", schema_str])
+            if runtime_settings.get("debug_output"):
+                log(f"Structured output: json_schema ({len(schema_str)} chars)", "INFO")
+        except (TypeError, ValueError) as e:
+            log(f"Ignoring malformed json_schema: {e}", "WARN")
 
     if resume_session_id:
         cmd.extend(["--resume", resume_session_id])
@@ -2551,20 +2618,6 @@ Image files to view:
         thinking_text = ""
         event_count = 0
 
-        # Timing diagnostics — lets us see whether deltas actually arrive in
-        # real time or all at once when the subprocess exits.
-        first_delta_time = None
-        last_delta_time = None
-        text_delta_count = 0
-
-        # Track whether we already pushed text/thinking through the stream
-        # callback during the live event loop. If Claude Code emits only
-        # complete 'assistant' events (no content_block_delta), we need to
-        # fire the callback at the end so downstream SSE generators still
-        # receive content.
-        stream_callback_fired_text = False
-        stream_callback_fired_thinking = False
-
         captured_session_id = None
 
         # Why: aggregate from result event preferred; fall back to max across assistant events.
@@ -2598,28 +2651,16 @@ Image files to view:
                     log(f"Error event: {error_msg}", "ERROR")
                     return {"response": f"Error: {error_msg}", "thinking": None}
 
-                # Handle content_block_delta for streaming thinking
+                # Accumulate content_block_delta into response/thinking buffers.
+                # Final assistant event is also handled below as a fallback;
+                # whichever arrives populates the buffers.
                 if event_type == "content_block_delta":
                     delta = event.get("delta", {})
                     delta_type = delta.get("type", "")
                     if delta_type == "thinking_delta":
-                        chunk = delta.get("thinking", "")
-                        thinking_text += chunk
-                        if stream_callback and chunk:
-                            stream_callback("thinking", chunk)
-                            stream_callback_fired_thinking = True
+                        thinking_text += delta.get("thinking", "")
                     elif delta_type == "text_delta":
-                        chunk = delta.get("text", "")
-                        response_text += chunk
-                        if chunk:
-                            now = time.time()
-                            if first_delta_time is None:
-                                first_delta_time = now
-                            last_delta_time = now
-                            text_delta_count += 1
-                        if stream_callback and chunk:
-                            stream_callback("text", chunk)
-                            stream_callback_fired_text = True
+                        response_text += delta.get("text", "")
 
                 # Handle assistant message (final content)
                 elif event_type == "assistant":
@@ -2651,7 +2692,17 @@ Image files to view:
                         log(f"Claude Code returned error: {error_msg}", "ERROR")
                         return {"response": f"Error: {error_msg}", "thinking": None}
 
-                    if "result" in event and not response_text:
+                    # When a json_schema was supplied, the CLI validates the
+                    # model output against it and surfaces the validated
+                    # payload in `structured_output`. That's what the client
+                    # actually asked for — return the JSON-serialized struct
+                    # as the response content so OpenAI's `response_format`
+                    # semantics are preserved. Fall back to natural language
+                    # if structured_output is missing (shouldn't happen when
+                    # --json-schema succeeded, but don't crash if it does).
+                    if json_schema is not None and "structured_output" in event:
+                        response_text = json.dumps(event["structured_output"])
+                    elif "result" in event and not response_text:
                         response_text = event["result"]
 
                     # Extract token usage
@@ -2688,8 +2739,8 @@ Image files to view:
         elapsed = time.time() - start_time
 
         # Distinguish a normal non-zero exit from a cancellation-via-kill.
-        # The SSE / non-streaming generators set process_holder["cancelled"]
-        # when they kill the subprocess on client disconnect; without this,
+        # The chat_completions response generator sets process_holder["cancelled"]
+        # when it kills the subprocess on client disconnect; without this,
         # the subsequent non-zero exit code would be logged as a scary ERROR
         # instead of the expected "user hit Stop" WARN.
         cancelled = bool(process_holder and process_holder.get("cancelled"))
@@ -2707,51 +2758,6 @@ Image files to view:
 
         if runtime_settings["debug_output"]:
             log(f"Events: {event_count} | Thinking: {len(thinking_text):,} chars | Response: {len(response_text):,} chars", "INFO")
-
-            # Streaming timing report — tells us whether text_delta events are
-            # arriving in real time or all at once when the subprocess exits.
-            if text_delta_count > 0 and first_delta_time and last_delta_time:
-                first_delta_latency = first_delta_time - start_time
-                stream_duration = last_delta_time - first_delta_time
-                if stream_duration > 0.01:
-                    rate = text_delta_count / stream_duration
-                    log(
-                        f"Stream timing: first delta @ {first_delta_latency:.2f}s, "
-                        f"{text_delta_count} deltas over {stream_duration:.2f}s "
-                        f"({rate:.1f} deltas/sec)",
-                        "INFO",
-                    )
-                else:
-                    log(
-                        f"Stream timing: first delta @ {first_delta_latency:.2f}s, "
-                        f"{text_delta_count} deltas arrived in <0.01s (BUFFERED — all at once!)",
-                        "WARN",
-                    )
-            else:
-                log(
-                    "Stream timing: Claude Code emitted no content_block_delta events "
-                    "(complete 'assistant' message only — no true streaming available)",
-                    "WARN",
-                )
-
-        # Fallback: if a stream_callback was provided but never fired during
-        # the loop, push the accumulated content through it now in small
-        # chunks. Downstream SSE generators need this to actually emit content
-        # events — otherwise ST receives role + stop + [DONE] and renders
-        # a blank message.
-        #
-        # ORDER MATTERS: thinking must fire BEFORE text. generate_stream_response
-        # buffers thinking chunks and flushes them as one clean <think> block
-        # the moment the first text chunk arrives — so if text arrives first
-        # with an empty thinking buffer, the flush happens empty and later
-        # thinking arrivals are silently dropped. Mirroring the natural order
-        # (thinking, then text) keeps both in the stream.
-        if stream_callback and not stream_callback_fired_thinking and thinking_text:
-            stream_callback("thinking", thinking_text)
-        if stream_callback and not stream_callback_fired_text and response_text:
-            fallback_chunk_size = 80  # chars per synthetic chunk
-            for i in range(0, len(response_text), fallback_chunk_size):
-                stream_callback("text", response_text[i:i + fallback_chunk_size])
 
         # Log thinking if present
         if thinking_text and runtime_settings["show_thinking_console"]:
@@ -2808,6 +2814,23 @@ Image files to view:
                 "INFO",
             )
 
+        # Character Memory v2 — stage this turn for delayed maintenance.
+        # We do NOT fire Sonnet maintenance immediately because that pollutes
+        # the DB on swipes. Instead, the response is buffered and committed
+        # on the *next* request once we can confirm the user accepted it
+        # (their next prompt will include this response in messages history).
+        # Swipe/regen → buffer is discarded and replaced. See stage_turn().
+        if memory_v2_active and memory_v2_char_key and clean_response and clean_response.strip():
+            try:
+                memory_v2.stage_turn(
+                    char_key=memory_v2_char_key,
+                    messages=messages,
+                    assistant_response=clean_response,
+                    char_name=memory_v2_char_key,
+                )
+            except Exception as e:
+                log(f"[memv2] stage_turn failed: {e}", "WARN")
+
         return {
             "response": clean_response,
             "thinking": thinking_text.strip() if thinking_text else None,
@@ -2847,6 +2870,29 @@ Image files to view:
                     os.unlink(temp_file.name)
                 except:
                     pass
+
+
+def _strip_markdown_json_fences(text: str) -> str:
+    """If the text is a ```json``` (or plain ```) fenced code block, return
+    the inner JSON. Otherwise return the text unchanged.
+
+    Used for the json_schema passthrough path: when Claude Code's native
+    structured_output isn't emitted (which happens inconsistently with
+    complex schemas or long system prompts), the natural-language
+    `result` field often contains the JSON wrapped in markdown fences.
+    Stripping the fences gives the client something JSON.parse-able.
+    Best-effort — if the text doesn't match the fenced shape, we leave
+    it alone and let the client handle the failure.
+    """
+    stripped = text.strip()
+    m = re.match(
+        r"^```(?:json)?\s*\n?(.+?)\n?```\s*$",
+        stripped,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    return text
 
 
 def consolidate_think_blocks(text: str) -> str:
@@ -2929,227 +2975,37 @@ def consolidate_think_blocks(text: str) -> str:
     return cleaned_text
 
 
-def stream_text_response(response_text: str):
+def sse_full_response(response_text: str):
     """
-    Stream a text response in OpenAI SSE format.
-    Used for both regular responses and chunking results.
+    Emit a full text response in OpenAI SSE format as a single content chunk
+    plus a stop chunk and the [DONE] terminator.
+
+    The bridge does not stream. The Claude Code CLI doesn't emit token deltas,
+    and trying to fake it with paced SSE chunks introduced bugs (silently
+    dropping late-arriving thinking blocks). For clients that request
+    `stream: true`, this produces a valid SSE response that arrives all at
+    once when Claude finishes, which is what they were going to see anyway.
     """
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-    chunk_size = 20  # Characters per chunk
+    created = int(time.time())
 
-    for i in range(0, len(response_text), chunk_size):
-        chunk = response_text[i:i + chunk_size]
-        data = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": DEFAULT_MODEL,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": chunk},
-                "finish_reason": None
-            }]
-        }
-        yield f"data: {json.dumps(data)}\n\n"
-
-    # Send final chunk with finish_reason
-    final_data = {
+    content_chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created,
         "model": DEFAULT_MODEL,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop"
-        }]
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": response_text}, "finish_reason": None}],
     }
-    yield f"data: {json.dumps(final_data)}\n\n"
+    final_chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": DEFAULT_MODEL,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield f"data: {json.dumps(content_chunk)}\n\n"
+    yield f"data: {json.dumps(final_chunk)}\n\n"
     yield "data: [DONE]\n\n"
-
-
-def _sse_delta(response_id: str, delta: dict, finish_reason=None) -> str:
-    """Build one OpenAI-format SSE data line from a delta payload."""
-    data = {
-        "id": response_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": DEFAULT_MODEL,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }],
-    }
-    return f"data: {json.dumps(data)}\n\n"
-
-
-def generate_stream_response(messages: list, tools: list = None, char_key: str = None):
-    """
-    Generate a real-time streaming response in OpenAI SSE format.
-
-    Runs call_claude_code on a worker thread with a callback that pushes
-    (kind, chunk) tuples onto a queue. This generator reads the queue and
-    yields SSE events as they arrive, so SillyTavern sees tokens in
-    real time instead of a full response dumped at once.
-
-    Thinking deltas are wrapped in a single <think>...</think> block, opened
-    on the first thinking chunk and closed when text starts (or when the
-    stream ends without any text).
-
-    If tools are provided, falls back to the buffered path — streaming and
-    mid-stream tool-call detection can't coexist safely in OpenAI format.
-    """
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-
-    # Tool-calling mode: parse_tool_calls needs the full response text, so
-    # we can't meaningfully stream. Use the buffered simulated path.
-    if tools:
-        result = call_claude_code(messages, tools=tools, char_key=char_key)
-        response_text = result["response"]
-        thinking_text = result.get("thinking")
-        if runtime_settings["include_thinking"] and thinking_text:
-            response_text = f"<think>\n{thinking_text}\n</think>\n\n{response_text}"
-        response_text = consolidate_think_blocks(response_text)
-        yield from stream_text_response(response_text)
-        return
-
-    # Real streaming path: worker thread produces, this generator consumes.
-    #
-    # Strategy: BUFFER thinking deltas into a list and flush them as a single
-    # cleaned-up <think> block the moment the first text_delta arrives. Then
-    # stream text_delta chunks live. This matches the shape consolidate_think_
-    # blocks produces (one clean <think> at the start + narrative after), so
-    # SillyTavern's think-block parser doesn't choke on streamed partial tags,
-    # mixed <think>/<thinking> variants, or orphaned [Tools]/[Context] sections.
-    q = queue.Queue()
-    worker_result = {}
-    # Shared holder so we can kill the Claude subprocess if the client
-    # disconnects mid-stream (e.g. the user hits Stop in SillyTavern).
-    process_holder = {}
-
-    def on_chunk(kind: str, chunk: str):
-        q.put((kind, chunk))
-
-    def worker():
-        try:
-            result = call_claude_code(messages, stream_callback=on_chunk, process_holder=process_holder, char_key=char_key)
-            worker_result["result"] = result
-        except Exception as e:
-            worker_result["error"] = str(e)
-            log(f"Stream worker crashed: {e}", "ERROR")
-        finally:
-            q.put(("__done__", None))
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
-    include_thinking = runtime_settings.get("include_thinking", True)
-    thinking_buffer = []         # Accumulated thinking chunks (not yet emitted)
-    thinking_flushed = False     # Have we already emitted the <think> block?
-    text_buffer = []             # Accumulated text chunks (for final consolidate pass)
-    any_text_emitted = False
-
-    # Simulated streaming pacing: Claude Code doesn't emit real token deltas,
-    # so we pace our SSE output with small sleeps to make ST feel streamed.
-    # The text chunks come from call_claude_code's end-of-loop fallback, which
-    # splits the response into 80-char pieces. Rates are chosen so a ~15K-char
-    # response takes a reasonable tail-time on top of the model wait:
-    #   slow     ≈ 250 chars/sec  → ~60s for 15K (read along as it types)
-    #   natural  ≈ 700 chars/sec  → ~22s for 15K (ChatGPT-ish pace)
-    #   fast     ≈ 2000 chars/sec → ~7.5s for 15K (visibly streamed, quick)
-    pacing_mode = runtime_settings.get("simulated_streaming", "natural")
-    pacing_delays = {
-        "off":     0.000,   # No delay — all chunks flush instantly
-        "slow":    0.320,   # 320ms per 80-char chunk ≈ 250 chars/sec
-        "natural": 0.115,   # 115ms per 80-char chunk ≈ 700 chars/sec
-        "fast":    0.040,   # 40ms  per 80-char chunk ≈ 2000 chars/sec
-    }
-    chunk_delay = pacing_delays.get(pacing_mode, 0.115)
-
-    def build_think_block(chunks):
-        """Normalize a list of thinking chunks into a single clean block."""
-        raw = "".join(chunks).strip()
-        if not raw:
-            return ""
-        # Strip any embedded <think>/<thinking> tags so we don't nest them
-        raw = re.sub(r"</?think(?:ing)?>", "", raw, flags=re.IGNORECASE)
-        raw = raw.strip()
-        if not raw:
-            return ""
-        return f"<think>\n{raw}\n</think>\n\n"
-
-    # Emit an initial delta with just the role. Do NOT include an empty content
-    # field — some SillyTavern parsers treat {"content":""} as "message done
-    # with no text" and ignore subsequent content deltas.
-    try:
-        yield _sse_delta(response_id, {"role": "assistant"})
-
-        while True:
-            # Poll with a timeout instead of blocking indefinitely, so we can
-            # emit SSE keepalive comments during long waits (thinking, tool
-            # use, etc.). Werkzeug only discovers that the client has
-            # disconnected when it tries to write — without periodic writes,
-            # a user who hits Stop in SillyTavern goes undetected and Claude
-            # runs to completion anyway. The keepalive forces a write
-            # attempt; if it fails, the exception propagates back to this
-            # yield and the outer finally kills the subprocess.
-            try:
-                kind, chunk = q.get(timeout=1.0)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if kind == "__done__":
-                break
-            if kind == "thinking":
-                if not include_thinking:
-                    continue
-                thinking_buffer.append(chunk)
-            elif kind == "text":
-                # First text chunk — flush the accumulated thinking as one clean block.
-                if not thinking_flushed:
-                    block = build_think_block(thinking_buffer) if thinking_buffer else ""
-                    if block:
-                        yield _sse_delta(response_id, {"content": block})
-                    thinking_flushed = True
-                text_buffer.append(chunk)
-                any_text_emitted = True
-                yield _sse_delta(response_id, {"content": chunk})
-                # Pace the stream so ST renders it incrementally rather than in one burst.
-                if chunk_delay > 0:
-                    time.sleep(chunk_delay)
-
-        # Thinking-only case: Claude produced no text (shouldn't normally happen,
-        # but handle it). Flush the think block so the user sees the reasoning.
-        if not thinking_flushed and thinking_buffer:
-            block = build_think_block(thinking_buffer)
-            if block:
-                yield _sse_delta(response_id, {"content": block})
-
-        # Surface worker errors after the stream if one happened before any text.
-        if "error" in worker_result and not any_text_emitted:
-            yield _sse_delta(
-                response_id,
-                {"content": f"[bridge error: {worker_result['error']}]"},
-            )
-
-        # Final stop event + OpenAI terminator
-        yield _sse_delta(response_id, {}, finish_reason="stop")
-        yield "data: [DONE]\n\n"
-    finally:
-        # Kill the Claude subprocess if it's still running. Covers normal
-        # completion (subprocess already exited → poll() != None → no-op) and
-        # client disconnect mid-stream (user hit Stop in SillyTavern → Flask
-        # closes the generator → we kill the subprocess so we stop accruing
-        # model wait time on a response nobody will read).
-        proc = process_holder.get("process")
-        if proc and proc.poll() is None:
-            try:
-                proc.kill()
-                process_holder["cancelled"] = True
-                log("Client disconnected mid-stream — killed Claude subprocess", "WARN")
-            except Exception as e:
-                log(f"Failed to kill Claude subprocess on disconnect: {e}", "ERROR")
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
@@ -3164,6 +3020,32 @@ def chat_completions():
         if runtime_settings.get("tool_calling_enabled", True):
             tools = data.get("tools", None)
         tool_choice = data.get("tool_choice", "auto")  # auto, none, or specific
+
+        # OpenAI-style structured output → Claude Code's --json-schema.
+        # Three response_format shapes exist in the OpenAI spec:
+        #   {"type":"text"}                       → no schema, default behavior
+        #   {"type":"json_object"}                → "return valid JSON" with no
+        #                                           shape constraint; send a
+        #                                           permissive object schema
+        #   {"type":"json_schema",
+        #    "json_schema":{"schema":{...}}}      → real schema, forward as-is
+        # Anything unrecognized is ignored silently (forward-compat with any
+        # future OpenAI variants we haven't heard of).
+        json_schema = None
+        response_format = data.get("response_format")
+        if isinstance(response_format, dict):
+            rf_type = response_format.get("type")
+            if rf_type == "json_schema":
+                js_wrapper = response_format.get("json_schema") or {}
+                # OpenAI nests the actual schema one level deeper; some clients
+                # flatten it. Accept both.
+                schema = js_wrapper.get("schema") if isinstance(js_wrapper, dict) else None
+                if isinstance(schema, dict):
+                    json_schema = schema
+                elif isinstance(js_wrapper, dict) and js_wrapper:
+                    json_schema = js_wrapper
+            elif rf_type == "json_object":
+                json_schema = {"type": "object"}
 
         # Debug: Log what we're receiving from SillyTavern
         if runtime_settings["debug_output"]:
@@ -3378,15 +3260,14 @@ Now, based on this context, please respond to the following request:
                 log("Chunking complete!")
                 runtime_settings["chunking_enabled"] = False  # Auto-disable after use
 
-                # Return streaming response if requested
+                # Return as SSE if requested, JSON otherwise. The bridge
+                # never produces real per-token streaming — both shapes carry
+                # the full response in one payload at the end.
                 if stream:
                     return Response(
-                        stream_text_response(response_text),
+                        sse_full_response(response_text),
                         mimetype="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive"
-                        }
+                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                     )
 
                 return jsonify({
@@ -3410,70 +3291,59 @@ Now, based on this context, please respond to the following request:
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 })
 
-        if stream:
-            # For streaming with tools, we need to handle differently
-            # For now, fall through to non-streaming if tools are present
-            if not tools:
-                # Trigger background lorebook analysis (starts in background thread)
-                trigger_lorebook_analysis(messages)
-                return Response(
-                    generate_stream_response(messages, tools=tools, char_key=original_char_key),
-                    mimetype="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        # Disable proxy buffering if the bridge is ever
-                        # fronted by nginx/Caddy/etc.
-                        "X-Accel-Buffering": "no",
-                    }
-                )
-
-        # Non-streaming response (or streaming with tools).
+        # The bridge does not stream. We run call_claude_code on a worker
+        # thread and drive the response as a generator that yields keepalives
+        # every second while Claude thinks, then yields the full payload at
+        # the end. The keepalive yields force Werkzeug to write to the socket
+        # periodically — if the client disconnected (user hit Stop in
+        # SillyTavern), the write fails, the exception propagates back to
+        # the yield, and the finally block kills the Claude subprocess so we
+        # stop burning model time on a response nobody will read.
         #
-        # We run call_claude_code on a worker thread and drive the response
-        # as a generator that yields whitespace keepalives every second while
-        # Claude thinks, then yields the final JSON at the end. The keepalive
-        # yields force Werkzeug to write to the socket periodically — if the
-        # client disconnected (user hit Stop in SillyTavern), the write fails,
-        # the exception propagates back to the yield, and the finally block
-        # kills the Claude subprocess so we stop burning model time on a
-        # response nobody will read.
+        # Two output shapes:
+        #   - stream=True (and no tool calls): SSE event stream — keepalive
+        #     is `: keepalive\n\n` (an SSE comment), final payload is one
+        #     content chunk + stop chunk + [DONE].
+        #   - otherwise (non-stream, or any tool-call response): JSON object.
+        #     Keepalive is " " (a JSON-spec-legal leading whitespace that
+        #     every mainstream parser tolerates), final payload is the full
+        #     chat.completion object.
         #
-        # Leading whitespace in a JSON response is spec-legal (RFC 8259) and
-        # every mainstream JSON parser tolerates it, so clients see a valid
-        # chat-completions payload at the end of the stream either way.
+        # Tool calls always go through the JSON branch — OpenAI's SSE shape
+        # for tool_calls is finicky and we're not trying to look like a real
+        # streaming endpoint anyway.
         process_holder = {}
         result_holder = {}
 
         def worker():
             try:
                 result_holder["result"] = call_claude_code(
-                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key
+                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key, json_schema=json_schema
                 )
             except Exception as e:
-                log(f"Non-streaming worker crashed: {e}", "ERROR")
+                log(f"Worker crashed: {e}", "ERROR")
                 result_holder["error"] = str(e)
 
         worker_thread = threading.Thread(target=worker, daemon=True)
         worker_thread.start()
 
-        def response_generator():
+        def response_generator(as_sse: bool):
+            keepalive = ": keepalive\n\n" if as_sse else " "
             try:
-                # Wait for the worker, yielding whitespace keepalives so we
-                # can detect client disconnect during the long Claude wait.
                 while worker_thread.is_alive():
                     worker_thread.join(timeout=1.0)
                     if worker_thread.is_alive():
-                        yield " "  # JSON-valid whitespace
+                        yield keepalive
 
-                # Worker finished — build and yield the final JSON response.
                 if "error" in result_holder:
-                    yield json.dumps({
-                        "error": {
-                            "message": result_holder["error"],
-                            "type": "bridge_error",
-                        }
-                    })
+                    err_payload = {
+                        "error": {"message": result_holder["error"], "type": "bridge_error"},
+                    }
+                    if as_sse:
+                        yield f"data: {json.dumps(err_payload)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    else:
+                        yield json.dumps(err_payload)
                     return
 
                 result = result_holder["result"]
@@ -3483,6 +3353,8 @@ Now, based on this context, please respond to the following request:
                 response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
                 if tool_calls:
+                    # Tool-call responses always serialize as JSON regardless
+                    # of the stream flag (see comment above).
                     log(f"Returning {len(tool_calls)} tool call(s) to SillyTavern")
                     for tc in tool_calls:
                         log(f"  Tool: {tc['function']['name']} | ID: {tc['id']}")
@@ -3498,11 +3370,7 @@ Now, based on this context, please respond to the following request:
                         "object": "chat.completion",
                         "created": int(time.time()),
                         "model": DEFAULT_MODEL,
-                        "choices": [{
-                            "index": 0,
-                            "message": message,
-                            "finish_reason": "stop",
-                        }],
+                        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
                         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                     }
                     log(f"Tool call response JSON: {json.dumps(response_obj)[:500]}...")
@@ -3510,31 +3378,54 @@ Now, based on this context, please respond to the following request:
                     yield json.dumps(response_obj)
                     return
 
-                if runtime_settings["include_thinking"] and thinking_text:
-                    response_text = f"<think>\n{thinking_text}\n</think>\n\n{response_text}"
-
-                response_text = consolidate_think_blocks(response_text)
+                if json_schema is not None:
+                    # Structured output: skip thinking-prepend + consolidate
+                    # (both would break JSON.parse on the client). Rescue
+                    # JSON from markdown fences when the CLI didn't emit a
+                    # validated structured_output block.
+                    response_text = _strip_markdown_json_fences(response_text)
+                else:
+                    if runtime_settings["include_thinking"] and thinking_text:
+                        response_text = f"<think>\n{thinking_text}\n</think>\n\n{response_text}"
+                    response_text = consolidate_think_blocks(response_text)
                 trigger_lorebook_analysis(messages)
 
-                yield json.dumps({
-                    "id": response_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": DEFAULT_MODEL,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": response_text,
-                        },
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                })
+                if as_sse:
+                    created = int(time.time())
+                    content_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": DEFAULT_MODEL,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": response_text}, "finish_reason": None}],
+                    }
+                    final_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": DEFAULT_MODEL,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(content_chunk)}\n\n"
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                else:
+                    yield json.dumps({
+                        "id": response_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": DEFAULT_MODEL,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": response_text},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    })
             finally:
-                # Same cancel-on-disconnect semantics as the SSE streaming
-                # path: the whitespace keepalives above force periodic writes
-                # so Werkzeug surfaces a closed socket, which lands here.
+                # Cancel-on-disconnect: the keepalive yields above force
+                # periodic writes, so Werkzeug surfaces a closed socket here
+                # and we kill the Claude subprocess.
                 proc = process_holder.get("process")
                 if proc and proc.poll() is None:
                     try:
@@ -3544,7 +3435,17 @@ Now, based on this context, please respond to the following request:
                     except Exception as e:
                         log(f"Failed to kill Claude subprocess on disconnect: {e}", "ERROR")
 
-        return Response(response_generator(), mimetype="application/json")
+        if stream:
+            return Response(
+                response_generator(as_sse=True),
+                mimetype="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        return Response(response_generator(as_sse=False), mimetype="application/json")
 
     except Exception as e:
         log(f"Error in chat_completions: {str(e)}", "ERROR")
@@ -3625,7 +3526,8 @@ def update_settings():
         runtime_settings["chunking_enabled"] = new_val
         log(f"CHUNKING: {old_val} -> {new_val}")
 
-    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "simulated_streaming", "cli_session_reuse", "update_check_enabled"]:
+    memory_v2_was_enabled = runtime_settings.get("character_memory_v2_enabled", False)
+    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "cli_session_reuse", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key"]:
         if key in data:
             # Coerce bridge_port to int and bounds-check. Invalid values are rejected.
             if key == "bridge_port":
@@ -3638,6 +3540,14 @@ def update_settings():
                 runtime_settings[key] = port
             else:
                 runtime_settings[key] = data[key]
+
+    # If the user just enabled memory v2, kick off the embedding model load
+    # in the background so the first prepare_turn doesn't pay the latency.
+    if (
+        not memory_v2_was_enabled
+        and runtime_settings.get("character_memory_v2_enabled", False)
+    ):
+        memory_v2.warmup_embeddings_async()
 
     # Persist the updated settings to disk so they survive bridge restarts.
     save_persisted_settings()
@@ -3654,6 +3564,165 @@ def update_settings():
     return jsonify({"status": "ok", "settings": runtime_settings})
 
 
+# =============================================================================
+# Character Memory v2 — REST endpoints (powers the GUI Memory tab)
+# =============================================================================
+# All routes scope to a single character (and optionally a single NPC under
+# them). The endpoints are intentionally narrow: list, read, reset, delete
+# row, save needs. Inline row editing and manual insert are read/write but
+# similarly thin — the GUI does the formatting work, the bridge just persists.
+#
+# Why not extension-style auth: this bridge runs on localhost and is already
+# trusted with the user's Claude session. No extra auth layer.
+
+
+@app.route("/api/memory/list", methods=["GET"])
+def memory_list():
+    """Return summary info for every character with a memory dir."""
+    return jsonify({"characters": memory_v2.list_characters()})
+
+
+def _memory_row_dict(row: dict) -> dict:
+    """Strip embedding bytes (not JSON-serializable) and normalize for the GUI."""
+    out = dict(row)
+    out.pop("embedding", None)
+    return out
+
+
+@app.route("/api/memory/<char_key>", methods=["GET"])
+def memory_get_char(char_key):
+    """Return all rows + needs + NPC list for one character."""
+    conn = memory_v2.get_connection(char_key)
+    if conn is None:
+        return jsonify({"error": "no DB for that char_key"}), 404
+    rows = [_memory_row_dict(r) for r in memory_v2.query_memories(
+        conn,
+        statuses=memory_v2.MEMORY_STATUSES,  # include dormant/resolved/etc for the GUI
+        limit=10000,
+    )]
+    needs = memory_v2.load_needs(char_key)
+    npcs = memory_v2.list_npcs(char_key)
+    seed = None
+    cdir = memory_v2.char_dir(char_key)
+    if cdir:
+        seed_path = os.path.join(cdir, "card_seed.json")
+        if os.path.exists(seed_path):
+            try:
+                with open(seed_path, "r", encoding="utf-8") as f:
+                    seed = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                seed = None
+    return jsonify({
+        "char_key": char_key,
+        "memories": rows,
+        "needs": needs,
+        "npcs": npcs,
+        "card_seed": seed,
+        "latest_turn": memory_v2.latest_turn(conn),
+    })
+
+
+@app.route("/api/memory/<char_key>/npc/<npc_key>", methods=["GET"])
+def memory_get_npc(char_key, npc_key):
+    """Return rows + card for one NPC under a character."""
+    card = memory_v2.load_npc_card(char_key, npc_key)
+    if card is None:
+        return jsonify({"error": "NPC not found"}), 404
+    conn = memory_v2.get_connection(char_key, npc_key=npc_key)
+    if conn is None:
+        return jsonify({"card": card, "memories": []})
+    rows = [_memory_row_dict(r) for r in memory_v2.query_memories(
+        conn,
+        statuses=memory_v2.MEMORY_STATUSES,
+        limit=10000,
+    )]
+    return jsonify({"card": card, "memories": rows})
+
+
+@app.route("/api/memory/<char_key>/reset", methods=["POST"])
+def memory_reset(char_key):
+    """Wipe a character's memory directory. Closes pool entries first."""
+    ok = memory_v2.reset_character(char_key)
+    return jsonify({"status": "ok" if ok else "error", "char_key": char_key}), (200 if ok else 500)
+
+
+@app.route("/api/memory/<char_key>/row/<int:row_id>", methods=["DELETE"])
+def memory_delete_row(char_key, row_id):
+    """Delete a single memory row."""
+    npc_key = request.args.get("npc")  # ?npc=marcus to target an NPC's DB
+    conn = memory_v2.get_connection(char_key, npc_key=npc_key) if npc_key else memory_v2.get_connection(char_key)
+    if conn is None:
+        return jsonify({"error": "no DB"}), 404
+    cur = conn.execute("DELETE FROM memories WHERE id = ?", (int(row_id),))
+    return jsonify({"status": "ok", "deleted": cur.rowcount})
+
+
+@app.route("/api/memory/<char_key>/row/<int:row_id>", methods=["PATCH"])
+def memory_update_row(char_key, row_id):
+    """Patch fields on a row. Body is a JSON dict of {field: value}."""
+    npc_key = request.args.get("npc")
+    conn = memory_v2.get_connection(char_key, npc_key=npc_key) if npc_key else memory_v2.get_connection(char_key)
+    if conn is None:
+        return jsonify({"error": "no DB"}), 404
+    data = request.json or {}
+    try:
+        ok = memory_v2.update_memory(conn, int(row_id), **data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"status": "ok" if ok else "no_change"})
+
+
+@app.route("/api/memory/<char_key>/row", methods=["POST"])
+def memory_insert_row(char_key):
+    """Manually insert a memory row. Body is a dict with at least type/content."""
+    npc_key = request.args.get("npc")
+    conn = memory_v2.get_connection(char_key, npc_key=npc_key) if npc_key else memory_v2.get_connection(char_key)
+    if conn is None:
+        return jsonify({"error": "no DB"}), 404
+    data = request.json or {}
+    if "content" not in data or "type" not in data:
+        return jsonify({"error": "type and content are required"}), 400
+    data.setdefault("created_turn", memory_v2.latest_turn(conn))
+    # Compute an embedding if available; the GUI has no business doing that.
+    if "embedding" not in data:
+        emb = memory_v2.embed(str(data["content"]))
+        if emb:
+            data["embedding"] = emb
+    try:
+        new_id = memory_v2.insert_memory(conn, **data)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"status": "ok", "id": new_id})
+
+
+@app.route("/api/memory/<char_key>/needs", methods=["POST"])
+def memory_save_needs(char_key):
+    """Overwrite needs.json. Body should be a complete needs dict."""
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    memory_v2.save_needs(char_key, data)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/memory/<char_key>/errors", methods=["GET"])
+def memory_errors(char_key):
+    """Return the tail of the Sonnet error log (last 50KB)."""
+    cdir = memory_v2.char_dir(char_key)
+    if not cdir:
+        return jsonify({"text": ""})
+    path = os.path.join(cdir, "sonnet_errors.log")
+    if not os.path.exists(path):
+        return jsonify({"text": ""})
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 50000))
+            text = f.read()
+        return jsonify({"text": text})
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/health", methods=["GET"])

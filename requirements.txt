@@ -1,2 +1,6 @@
 flask>=2.0.0
 flask-cors>=3.0.0
+# Character memory v2 — embeddings for semantic retrieval.
+# First import downloads ~80MB model into ~/.cache/huggingface.
+sentence-transformers>=2.2.0
+numpy>=1.24.0
