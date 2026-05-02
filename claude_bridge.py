@@ -28,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -2168,6 +2168,13 @@ def _extract_latest_user_text(messages: list) -> str:
     return "\n\n".join(parts)
 
 
+def _count_user_msgs(messages: list) -> int:
+    """Count messages with role=='user'. Used to disambiguate swipes (which
+    add an assistant message without a new user message) from real accepts
+    (which add a new user message)."""
+    return sum(1 for m in messages if m.get("role") == "user")
+
+
 def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     """Return (char_key, session_id_or_None, reason).
 
@@ -2198,6 +2205,7 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
             return (char_key, None, "no prior session")
         session_id = entry.get("session_id")
         last_count = entry.get("last_message_count", 0)
+        last_user_count = entry.get("last_user_count")
 
     if not session_id:
         return (char_key, None, "missing session_id")
@@ -2212,6 +2220,21 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
             SESSION_MAP.pop(char_key, None)
             _save_sessions()
         return (char_key, None, f"message delta {delta} invalidates session")
+
+    # Disambiguate swipe vs accept inside delta==1/2. ST sends the swiped
+    # assistant response back as part of history when the user clicks swipe,
+    # so total delta=+1 with NO new user message is the swipe shape — and
+    # resuming there causes the CLI to act like a "continue" button instead
+    # of regenerating the turn. Compare the user-message count: if it didn't
+    # advance, this is a swipe regardless of total delta.
+    if last_user_count is not None:
+        new_user_count = _count_user_msgs(messages)
+        user_delta = new_user_count - last_user_count
+        if user_delta <= 0:
+            with _SESSION_LOCK:
+                SESSION_MAP.pop(char_key, None)
+                _save_sessions()
+            return (char_key, None, f"swipe detected (user_delta={user_delta}, total_delta={delta})")
 
     # Historically we also hashed system messages to invalidate when the
     # system prompt / preset / character card changed. That hash fired
@@ -2230,10 +2253,12 @@ def _update_session(char_key: str, session_id: str, messages: list):
     if not char_key or char_key == "default" or not session_id:
         return
     new_count = len(messages)
+    new_user_count = _count_user_msgs(messages)
     with _SESSION_LOCK:
         SESSION_MAP[char_key] = {
             "session_id": session_id,
             "last_message_count": new_count,
+            "last_user_count": new_user_count,
             "updated_at": time.time(),
         }
         _save_sessions()
@@ -2405,6 +2430,32 @@ Push boundaries. Be unpredictable, experimental, and bold. Take dramatic narrati
             tool_section = f"\n\n{TOOL_CALLING_INSTRUCTIONS}\n{tool_definitions}\n"
             log(f"Tools provided: {len(tools)} tools")
 
+        # Thinking guidance — only when the bridge has thinking enabled. The
+        # block deliberately avoids prescribing structured sections (no
+        # [Tools]/[Context]/etc.); past experience with rigid CoT templates
+        # is that the model exhausts the visible-output budget filling
+        # sections and never reaches narrative. Keeping it loose lets the
+        # model self-pace its planning.
+        if runtime_settings.get("include_thinking", True):
+            response_section = """=== YOUR RESPONSE ===
+Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
+
+PLANNING + RESPONSE FORMAT:
+You may plan briefly inside a <think>...</think> block before writing the narrative. Keep planning short — a paragraph or two of free-form notes is plenty. No structured sections, no per-character templates, no exhaustive analysis: the heavy character/world tracking is already handled out-of-band and injected for you. Just orient yourself, decide the beat, then write.
+
+CRITICAL — NARRATIVE OUTPUT IS MANDATORY:
+Your response MUST contain narrative prose AFTER </think> closes. A response that is only <think>...</think> with no narrative after is a hard failure — the user sees nothing, the scene breaks, the turn is wasted.
+- Always close </think> before writing narrative. Always write narrative after it.
+- If you catch yourself adding "one more section" to the planning, stop. Close the tag and write.
+- The narrative is the actual response. Without it, you have produced nothing.
+
+Now: think briefly if needed, close </think>, and write the scene."""
+        else:
+            response_section = """=== YOUR RESPONSE ===
+Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
+
+Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response."""
+
         # Include full system prompt in the conversation
         prompt = f"""=== SYSTEM PROMPT (FOLLOW EXACTLY) ===
 
@@ -2416,19 +2467,7 @@ Push boundaries. Be unpredictable, experimental, and bold. Take dramatic narrati
 
 {prompt}
 
-=== YOUR RESPONSE ===
-Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
-
-CRITICAL — NARRATIVE OUTPUT IS MANDATORY (read this carefully):
-Your response is REQUIRED to contain narrative prose AFTER your </think> block closes. A response that is only <think>...</think> with no narrative after is a HARD FAILURE — the user sees nothing, the scene breaks, the entire turn is wasted. This has been happening too often. Stop letting it happen.
-
-Concrete rules:
-- Keep <think> proportionate. A few hundred words of internal planning is plenty for most turns. More than ~1000 words of thinking is almost never buying better output — it's just consuming the budget you need to actually WRITE the scene.
-- Trust your first read. You already know the characters, the scene, the stakes. Don't re-derive them. Plan briefly, close the tag, write.
-- If you find yourself thinking "I should think about X more before writing" — STOP. Close </think> right now. Begin the prose. You can think mid-narrative inside another <think> block later if you genuinely need to, but the FIRST output after this prompt MUST contain narrative prose.
-- The narrative must come AFTER </think>, in plain prose. It is the actual response the user sees. Without it, you have produced nothing.
-
-Now: think briefly if needed, close </think>, and write the scene."""
+{response_section}"""
 
     # Add image viewing instructions if there are unprocessed images
     if all_image_paths:
@@ -2626,6 +2665,10 @@ Image files to view:
         input_tokens_max = 0
         output_tokens_max = 0
         result_usage_seen = False
+        # Most recent message.stop_reason from the CLI's assistant events.
+        # Surfaced loudly only when the narrative comes back empty — see the
+        # post-loop diagnostic below.
+        last_stop_reason = None
 
         if runtime_settings["debug_output"]:
             log("Streaming response...", "INFO")
@@ -2665,6 +2708,16 @@ Image files to view:
                 # Handle assistant message (final content)
                 elif event_type == "assistant":
                     message = event.get("message", {})
+                    # Capture stop_reason — single most useful diagnostic when
+                    # narrative comes back empty. "end_turn" = model decided
+                    # it was done (often after a long <think> block); "max_tokens"
+                    # = hit the output cap mid-generation; "stop_sequence" =
+                    # something in the prompt is matching as a stop sequence;
+                    # "refusal" = safety filter stopped output. Logged below
+                    # only when response is empty (otherwise it's just noise).
+                    sr = message.get("stop_reason")
+                    if sr:
+                        last_stop_reason = sr
                     if not result_usage_seen:
                         a_usage = message.get("usage") or {}
                         cache_read_max = max(cache_read_max, a_usage.get("cache_read_input_tokens") or 0)
@@ -2757,7 +2810,16 @@ Image files to view:
             return {"response": f"Error from Claude Code: {error_msg}", "thinking": None}
 
         if runtime_settings["debug_output"]:
-            log(f"Events: {event_count} | Thinking: {len(thinking_text):,} chars | Response: {len(response_text):,} chars", "INFO")
+            log(
+                f"Events: {event_count} | Thinking: {len(thinking_text):,} chars | "
+                f"Response: {len(response_text):,} chars | stop_reason={last_stop_reason!r}",
+                "INFO",
+            )
+            # Also dump the last 300 chars of the response so we can see
+            # exactly where the model stopped — does it close </think>? does
+            # it have narrative? does it end mid-sentence? etc.
+            tail = response_text.strip()[-300:].replace("\n", " | ")
+            log(f"Response tail (last 300): {tail}", "INFO")
 
         # Log thinking if present
         if thinking_text and runtime_settings["show_thinking_console"]:
@@ -2773,6 +2835,59 @@ Image files to view:
         if response_text and runtime_settings.get("debug_output"):
             preview = response_text[:100].replace('\n', ' ')
             log(f"Preview: {preview}...", "INFO")
+
+        # Loud diagnostic when the response failed to produce real narrative.
+        # Three failure shapes we care about:
+        #   1. response_text empty, thinking_text present — API extended
+        #      thinking ran but no visible text emitted (rare with prompt-
+        #      style <think> tags).
+        #   2. response_text contains an opening <think> with no closing
+        #      </think> — model wrote prompt-style thinking as visible text
+        #      and got cut off mid-block.
+        #   3. response_text contains a closed </think> but everything after
+        #      it is empty/whitespace — model finished thinking and stopped
+        #      before any narrative.
+        # In all three cases, stop_reason is the most useful diagnostic:
+        #   end_turn      → model decided it was done; usually means the
+        #                   structured template completed and the model treated
+        #                   it as the response. Fix prompt side — trim the
+        #                   template, drop effort, or rephrase the closing
+        #                   section so it doesn't read as "we're done."
+        #   max_tokens    → hit the output cap mid-generation. Raise the cap
+        #                   or shrink the thinking template.
+        #   stop_sequence → something in the prompt is matching as a stop
+        #                   sequence and terminating early.
+        #   refusal       → safety filter intercepted.
+        rt_stripped = response_text.strip()
+        has_open_think = "<think>" in rt_stripped.lower()
+        # Find the last </think> — anything after it is candidate narrative.
+        rt_lower = rt_stripped.lower()
+        close_idx = rt_lower.rfind("</think>")
+        post_think = rt_stripped[close_idx + len("</think>"):].strip() if close_idx != -1 else rt_stripped
+        narrative_missing = (
+            (not rt_stripped and thinking_text.strip())                 # shape 1
+            or (has_open_think and close_idx == -1)                     # shape 2
+            or (has_open_think and close_idx != -1 and not post_think)  # shape 3
+        )
+        if narrative_missing:
+            tail_source = response_text if rt_stripped else thinking_text
+            tail = tail_source.strip()[-500:].replace("\n", " | ")
+            shape = (
+                "thinking-only-channel" if not rt_stripped else
+                "unclosed-<think>" if close_idx == -1 else
+                "closed-but-empty-after"
+            )
+            log(
+                f"NARRATIVE MISSING ({shape}): stop_reason={last_stop_reason!r} "
+                f"output_tokens={output_tokens_max} response_chars={len(response_text)} "
+                f"thinking_chars={len(thinking_text)} — last 500 chars: {tail}",
+                "WARN",
+            )
+        elif runtime_settings.get("debug_output") and last_stop_reason and last_stop_reason != "end_turn":
+            # Surface non-end_turn stops on successful responses too — still
+            # informative (e.g. max_tokens with narrative present means the
+            # narrative itself was truncated).
+            log(f"stop_reason={last_stop_reason!r}", "INFO")
 
         # Parse for tool calls
         clean_response, tool_calls = parse_tool_calls(response_text.strip())
@@ -3387,7 +3502,31 @@ Now, based on this context, please respond to the following request:
                 else:
                     if runtime_settings["include_thinking"] and thinking_text:
                         response_text = f"<think>\n{thinking_text}\n</think>\n\n{response_text}"
+                    pre_consolidate_len = len(response_text)
                     response_text = consolidate_think_blocks(response_text)
+                    if runtime_settings.get("debug_output"):
+                        # Surface what we're actually shipping to ST. The raw
+                        # model output is logged elsewhere; this captures
+                        # whether consolidate_think_blocks (which dedups think
+                        # blocks and tries to rescue "orphaned thinking" that
+                        # leaked outside tags) is changing the payload.
+                        delta = pre_consolidate_len - len(response_text)
+                        rt_lower_final = response_text.lower()
+                        open_count = rt_lower_final.count("<think>")
+                        close_count = rt_lower_final.count("</think>")
+                        last_close = rt_lower_final.rfind("</think>")
+                        narrative_chars = (
+                            len(response_text) - (last_close + len("</think>"))
+                            if last_close != -1 else len(response_text)
+                        )
+                        sent_tail = response_text.strip()[-300:].replace("\n", " | ")
+                        log(
+                            f"FINAL → ST: chars={len(response_text)} (delta: {delta:+d}) "
+                            f"| <think>={open_count} </think>={close_count} "
+                            f"| narrative_after_last_close={narrative_chars}",
+                            "INFO",
+                        )
+                        log(f"FINAL tail: {sent_tail}", "INFO")
                 trigger_lorebook_analysis(messages)
 
                 if as_sse:
