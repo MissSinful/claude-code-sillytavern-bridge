@@ -28,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -2175,6 +2175,49 @@ def _count_user_msgs(messages: list) -> int:
     return sum(1 for m in messages if m.get("role") == "user")
 
 
+def _msg_text(m: dict) -> str:
+    """Extract the text content of a chat-completion message, handling both
+    plain-string content and OpenAI's multimodal-list shape."""
+    content = m.get("content", "")
+    if isinstance(content, list):
+        return "\n".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return str(content) if content is not None else ""
+
+
+def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
+    """Hash the first `prefix_count` user/assistant messages by content.
+
+    Skips system messages because ST inserts/removes lorebook system
+    entries between turns, which would invalidate the cache spuriously
+    every turn for any user with World Info active. User+assistant content
+    only changes when the user explicitly edits the chat — that's the
+    signal we actually want to catch.
+
+    First 200 chars per message are enough; an edit virtually always
+    changes something near the start. Keeps the hash work cheap.
+    """
+    sigs = []
+    count = 0
+    for m in messages:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        if count >= prefix_count:
+            break
+        sigs.append(f"{m['role'][0]}:{_msg_text(m)[:200]}")
+        count += 1
+    if not sigs:
+        return ""
+    return hashlib.md5("|".join(sigs).encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _count_user_asst(messages: list) -> int:
+    """Count user+assistant messages, skipping system entries."""
+    return sum(1 for m in messages if m.get("role") in ("user", "assistant"))
+
+
 def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     """Return (char_key, session_id_or_None, reason).
 
@@ -2206,6 +2249,8 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
         session_id = entry.get("session_id")
         last_count = entry.get("last_message_count", 0)
         last_user_count = entry.get("last_user_count")
+        last_user_asst_count = entry.get("last_user_asst_count")
+        last_prefix_hash = entry.get("last_prefix_hash")
 
     if not session_id:
         return (char_key, None, "missing session_id")
@@ -2236,6 +2281,25 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
                 _save_sessions()
             return (char_key, None, f"swipe detected (user_delta={user_delta}, total_delta={delta})")
 
+    # Detect prefix edits: if the user changed an earlier message's content
+    # (without changing message counts), the CLI session's cached prefix is
+    # stale and must be invalidated — otherwise the model never sees the
+    # edit because --resume only sends the latest user message.
+    #
+    # We hash the user+assistant content of the previous prefix on session
+    # capture, then on the next request hash the SAME prefix length from
+    # the new messages. If the hashes differ, something in the prefix was
+    # edited → invalidate. System messages are excluded from the hash so
+    # ST's lorebook entries (which churn every turn as keywords shift)
+    # don't trigger spurious invalidation.
+    if last_user_asst_count and last_prefix_hash:
+        new_prefix_hash = _hash_user_asst_prefix(messages, last_user_asst_count)
+        if new_prefix_hash and new_prefix_hash != last_prefix_hash:
+            with _SESSION_LOCK:
+                SESSION_MAP.pop(char_key, None)
+                _save_sessions()
+            return (char_key, None, "prefix edit detected (content hash changed)")
+
     # Historically we also hashed system messages to invalidate when the
     # system prompt / preset / character card changed. That hash fired
     # every turn for users with active lorebooks (ST adds/removes WI-entry
@@ -2254,11 +2318,15 @@ def _update_session(char_key: str, session_id: str, messages: list):
         return
     new_count = len(messages)
     new_user_count = _count_user_msgs(messages)
+    new_user_asst_count = _count_user_asst(messages)
+    new_prefix_hash = _hash_user_asst_prefix(messages, new_user_asst_count)
     with _SESSION_LOCK:
         SESSION_MAP[char_key] = {
             "session_id": session_id,
             "last_message_count": new_count,
             "last_user_count": new_user_count,
+            "last_user_asst_count": new_user_asst_count,
+            "last_prefix_hash": new_prefix_hash,
             "updated_at": time.time(),
         }
         _save_sessions()
