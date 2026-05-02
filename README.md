@@ -15,6 +15,7 @@ Uses your **Claude Code subscription**. No API keys, no per-token billing, no cr
 SillyTavern is an excellent frontend for creative writing and roleplay, but it speaks OpenAI's API format. Claude Code CLI is how you access Claude's best models on a subscription plan — but it's designed for coding, not long-form fiction. This bridge makes them talk to each other, and adds the things you actually want for long RPs that coding assistants don't care about:
 
 - **Per-character running summaries** so 200-message conversations don't re-send the whole backlog every turn
+- **Persistent Character Memory** — structured per-character DB so characters actually remember desires, relationships, and recurring NPCs across sessions
 - **Narrative-focused system prompt injection** that overrides Claude Code's built-in "you are a coding assistant" framing
 - **Image handling** via Claude Code's native `Read` tool — share reference images in SillyTavern and Claude actually sees them
 - **Auto-lorebook** generation that builds World Info entries from your roleplay in the background
@@ -23,18 +24,25 @@ SillyTavern is an excellent frontend for creative writing and roleplay, but it s
 ## Features
 
 - OpenAI-compatible `/v1/chat/completions` endpoint (SillyTavern just points at it)
-- GUI dashboard at `http://localhost:5001/` with six tabs covering every setting
+- GUI dashboard at `http://localhost:5001/` with tabs for Settings, System Prompt, Tools, Lorebook, Memory, and Test
+- **Model picker** — Opus 4.7, Opus 4.6, or Sonnet, selected in the bridge GUI (SillyTavern's model selector is ignored)
+- **Effort levels** — Low / Medium / High / xHigh / Max for the Claude CLI's reasoning budget. xHigh and Max require Opus 4.7; older models clamp down automatically. Sonnet is also clamped because it produces no narrative above Medium.
+- **Character Memory** — structured per-character SQLite + sentence-transformers embeddings + Sonnet librarian. Tracks desires, events, facts, rules, relationships, traits, places, possessions, body state, and secrets across sessions. Sonnet curates relevant memories before each Opus turn (in-band) and updates the DB after (background). Persistent NPCs introduced mid-RP get their own sub-DBs. Inspect/edit everything in the Memory tab. See `MEMORY_DESIGN.md` for the architecture.
 - **Per-character auto-summary** — each character's narrative digest lives in its own cache slot, keyed by a hash of the greeting. Switching characters auto-swaps summaries; no manual cache clearing.
+- **CLI session reuse** — captures the Claude CLI's session and resumes via `--resume` on follow-up turns, sending only the latest user message instead of the full history. Big input-token savings on long RPs. Auto-invalidates on swipes, edits, or prefix changes.
 - **Chunking mode** — one-shot reset that rebuilds a character's summary from an imported chat file
 - **Editable prompt templates** at `prompts/*.md` for summarization, condensation, and chunk processing. Hot-reloads on every request — no server restart.
 - **Per-character image pipeline** — SillyTavern base64 images get saved to `temp_images/` and injected as file paths so Claude Code's `Read` tool can view them directly
-- **Auto-lorebook** generation after each response using Sonnet for efficiency, plus a Deep Analysis mode that scans a full chat file
+- **Auto-lorebook** generation after each response using Sonnet for efficiency, plus a Deep Analysis mode that scans a full chat file, and a manual entry editor
 - **Creativity modes** (Precise / Balanced / Creative / Wild) — prompt-based style control since Claude Code CLI doesn't expose temperature
-- **Simulated streaming** with configurable pacing (Off / Slow / Natural / Fast) — Claude Code doesn't emit token deltas, so the bridge paces the completed response through SSE to make SillyTavern render it progressively
+- **Conditional thinking guidance** — when `include_thinking` is on, the bridge injects a lightweight planning instruction so the model uses `<think>...</think>` without you needing a heavy CoT template in your preset
+- **`char_key` pinning** — pin a character's key from the Memory tab so small card edits don't change the auto-derived hash and orphan the existing memory DB or CLI session
+- **Test tab** — fire a quick test message at the bridge from the GUI without going through SillyTavern, useful for sanity checks
 - **Settings persistence** — model, effort, creativity, thresholds, and port all survive bridge restarts via `bridge_settings.json`
 - **Configurable port** from the GUI (default `:5001`)
 - **Tool calling fallback** for SillyTavern extensions like TunnelVision
-- **Debug logging** with structured output, token usage panels, and streaming timing diagnostics
+- **Update checker** — checks GitHub releases on startup and warns if a newer version is available
+- **Debug logging** with structured output, token usage panels, narrative-failure detection, and `stop_reason` capture
 
 ## What it actually produces
 
@@ -67,6 +75,8 @@ cd claude-code-sillytavern-bridge
 pip install -r requirements.txt
 ```
 
+`requirements.txt` includes `sentence-transformers` and `numpy` for Character Memory's semantic retrieval. The first time the model is needed (when you enable Character Memory in the GUI), it downloads `all-MiniLM-L6-v2` (~80MB) into `~/.cache/huggingface`. If you don't enable Character Memory, the model never loads.
+
 Start the bridge:
 
 **Windows:**
@@ -98,6 +108,8 @@ Most features work automatically once the bridge is running and configured. High
 
 **Enable auto-summary** early in a new chat. Tools tab → toggle Auto-Summary on. The default threshold updates the summary every 20 new messages, which is a reasonable balance for Opus-effort-high usage caps. Without it, SillyTavern re-sends your entire message history on every turn, which eats through usage limits fast on long RPs.
 
+**Enable Character Memory** in the Settings tab if you want characters to actually remember things across sessions — desires, relationships, learned rules about you, recurring NPCs. The first turn for a new character runs a one-time Sonnet bootstrap (~5s) that seeds the DB from the card. After that, every turn is enriched with a curated memory block in the prompt, and a background Sonnet pass updates the DB after the response. Inspect everything in the Memory tab. If you've got old `state.md` / `diary.md` / `rules.md` files from earlier versions of the bridge, they auto-migrate to the new DB on first use.
+
 **Editing prompts.** The bridge's internal prompts live as markdown files in `prompts/`:
 
 | File | What it does |
@@ -115,10 +127,10 @@ Edit any of these, save, and the next request picks up the change. No server res
 
 These are **architectural**, not bugs — they're properties of running Claude Code CLI as a subprocess per request, and there's no clean fix inside the current CLI version.
 
-- **No real token streaming.** Claude Code CLI doesn't emit incremental `content_block_delta` events for subprocess callers — it ships the full response in one `assistant` event at the end. The bridge collects the full response and then paces it through SSE (configurable via Simulated Streaming) so the SillyTavern experience still feels streamed. Total wall-clock time is `model_time + stream_pace_time`.
+- **No streaming.** Claude Code CLI doesn't emit incremental `content_block_delta` events for subprocess callers — it ships the full response in one `assistant` event at the end. The bridge waits for the full response and returns it in one payload. When SillyTavern requests `stream: true`, it gets a valid SSE stream containing one content chunk + stop + `[DONE]`. Earlier versions tried to pace the response through SSE to look streamed; that silently dropped content on Opus 4.7 and was removed.
 - **No temperature / sampling parameters.** Claude Code CLI doesn't expose `temperature`, `top_p`, or `top_k`. The Creativity setting (Precise / Balanced / Creative / Wild) is a prompt-based style modifier — Claude follows the style instructions, but it's not the same as a real temperature slider.
-- **Per-request subprocess overhead.** Every RP turn spawns a fresh `claude -p` process, which adds startup latency compared to a persistent HTTP client. Not a problem for the long thinking times typical of high-effort requests, but noticeable for small ones.
-- **No prompt caching control.** Claude Code manages its own caching internally; the bridge can't directly set cache breakpoints. Auto-summary mitigates this by keeping the stable prefix large and the variable suffix small.
+- **Per-request subprocess overhead.** Every RP turn spawns a fresh `claude -p` process, which adds startup latency compared to a persistent HTTP client. Not a problem for the long thinking times typical of high-effort requests, but noticeable for small ones. CLI session reuse mitigates this on follow-up turns.
+- **No prompt caching control.** Claude Code manages its own caching internally; the bridge can't directly set cache breakpoints. Auto-summary and CLI session reuse both mitigate this by keeping the stable prefix large and the variable suffix small.
 
 If any of these become dealbreakers for you, the right move is an alternative backend mode that hits the Anthropic SDK directly — the groundwork is there, but it's not currently implemented.
 
@@ -127,6 +139,7 @@ If any of these become dealbreakers for you, the right move is an alternative ba
 ```
 claude-code-sillytavern-bridge/
 ├── claude_bridge.py           # Main Flask server and subprocess wrapper
+├── memory_v2.py               # Character Memory: SQLite + embeddings + Sonnet librarian
 ├── modify_preset.py           # Standalone utility for SillyTavern preset tweaks
 ├── requirements.txt           # Python dependencies
 ├── run_bridge.bat             # Windows launcher
@@ -138,8 +151,10 @@ claude-code-sillytavern-bridge/
 │   ├── summarize_chunk.md
 │   └── condense_chronological.md
 ├── cache/                     # Per-character summary cache (gitignored)
+├── character_memory/          # Per-character memory DBs + needs + NPCs (gitignored)
 ├── temp_images/               # SillyTavern base64 image dumps (gitignored)
 ├── bridge_settings.json       # Persisted runtime settings (gitignored)
+├── bridge_sessions.json       # Captured CLI session IDs for --resume (gitignored)
 └── CLAUDE.md                  # Project notes for Claude Code itself
 ```
 
