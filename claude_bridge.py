@@ -28,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -3804,11 +3804,54 @@ def memory_update_row(char_key, row_id):
     if conn is None:
         return jsonify({"error": "no DB"}), 404
     data = request.json or {}
+    # Re-embed when content changes — otherwise the embedding still points at
+    # the old text and semantic search ranks the row by the wrong vector.
+    # The op-handler path (_op_update) already does this; keep the GUI path
+    # consistent.
+    if "content" in data and "embedding" not in data:
+        emb = memory_v2.embed(str(data["content"]))
+        if emb:
+            data["embedding"] = emb
     try:
         ok = memory_v2.update_memory(conn, int(row_id), **data)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"status": "ok" if ok else "no_change"})
+
+
+@app.route("/api/memory/<char_key>/row/<int:row_id>/move", methods=["POST"])
+def memory_move_row(char_key, row_id):
+    """Move a row from main↔NPC or NPC↔NPC within the same character.
+
+    Body: {"to_npc": "<npc_key>" or null}
+    Query: ?npc=<source_npc_key>  (omit for main as source)
+    """
+    source_npc_key = request.args.get("npc") or None
+    data = request.json or {}
+    target_npc_key = data.get("to_npc") or None
+    new_id, err = memory_v2.move_memory(
+        char_key,
+        int(row_id),
+        source_npc_key=source_npc_key,
+        target_npc_key=target_npc_key,
+    )
+    if err and new_id is None:
+        return jsonify({"error": err}), 400
+    payload = {"status": "ok", "new_id": new_id}
+    if err:
+        # The insert succeeded but delete failed — partial state. Surface it.
+        payload["warning"] = err
+    return jsonify(payload)
+
+
+@app.route("/api/memory/<char_key>/npc/<npc_key>/card", methods=["PATCH"])
+def memory_update_npc_card(char_key, npc_key):
+    """Patch editable NPC card fields: name, bio, aliases, status."""
+    data = request.json or {}
+    ok, err = memory_v2.update_npc_card(char_key, npc_key, data)
+    if not ok:
+        return jsonify({"error": err or "update failed"}), 400 if err else 500
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/memory/<char_key>/row", methods=["POST"])

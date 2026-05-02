@@ -1364,6 +1364,12 @@
 
                 <!-- Memories sub-panel -->
                 <div id="memSub_memories" class="memSubPanel">
+                    <!-- Entity scope selector: which DB are we looking at? -->
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
+                        <label style="font-size:11px;color:var(--paper-faint);text-transform:uppercase;letter-spacing:0.12em;">Entity:</label>
+                        <div id="memEntityPills" style="display:flex;gap:6px;flex-wrap:wrap;flex:1;"></div>
+                        <button class="toggle-btn" id="memAddRowBtn" style="font-size:11px;">+ New entry</button>
+                    </div>
                     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
                         <label style="font-size:11px;color:var(--paper-faint);text-transform:uppercase;letter-spacing:0.12em;">Filter:</label>
                         <select id="memFilterType" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
@@ -1392,7 +1398,7 @@
                                     <th style="padding:8px;border-bottom:1px solid var(--rule);">status</th>
                                     <th style="padding:8px;border-bottom:1px solid var(--rule);">content</th>
                                     <th style="padding:8px;border-bottom:1px solid var(--rule);">turn</th>
-                                    <th style="padding:8px;border-bottom:1px solid var(--rule);"></th>
+                                    <th style="padding:8px;border-bottom:1px solid var(--rule);">actions</th>
                                 </tr>
                             </thead>
                             <tbody id="memTableBody"></tbody>
@@ -1407,27 +1413,12 @@
                     <button class="toggle-btn" id="memNeedsSaveBtn" style="margin-top:12px;">Save needs</button>
                 </div>
 
-                <!-- NPCs sub-panel -->
+                <!-- NPCs sub-panel: edit cards (name/bio/aliases/status). For
+                     the NPC's memory rows, click "View memories" → switches to
+                     the Memories sub-tab pre-scoped to that NPC. -->
                 <div id="memSub_npcs" class="memSubPanel" style="display:none;">
+                    <p style="color:var(--paper-faint);font-size:12px;">Edit NPC card metadata here. To inspect or edit an NPC's memory rows, hit "View memories" on their card — that scopes the Memories sub-tab to their DB.</p>
                     <div id="memNpcsBody"></div>
-                    <div id="memNpcDetail" style="margin-top:16px;display:none;">
-                        <h4 id="memNpcDetailTitle" style="font-family:var(--font-mono);"></h4>
-                        <div id="memNpcDetailMeta" style="color:var(--paper-faint);font-size:12px;font-family:var(--font-mono);margin-bottom:8px;"></div>
-                        <div style="overflow-x:auto;border:1px solid var(--rule);">
-                            <table style="width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px;">
-                                <thead style="background:var(--ink-sunk);">
-                                    <tr style="text-align:left;">
-                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">id</th>
-                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">type</th>
-                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">subj</th>
-                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">imp</th>
-                                        <th style="padding:8px;border-bottom:1px solid var(--rule);">content</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="memNpcDetailRows"></tbody>
-                            </table>
-                        </div>
-                    </div>
                 </div>
 
                 <!-- Card Seed sub-panel -->
@@ -1440,6 +1431,60 @@
                 <div id="memSub_errors" class="memSubPanel" style="display:none;">
                     <p style="color:var(--paper-faint);font-size:12px;">Tail of <code>sonnet_errors.log</code> for this character. Empty means no recent maintenance failures.</p>
                     <pre id="memErrorsBody" style="background:var(--ink-sunk);padding:12px;border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;max-height:60vh;overflow:auto;"></pre>
+                </div>
+            </div>
+
+            <!-- Edit/Insert modal for memory rows. Hidden by default. Opened
+                 by row Edit (with rowData populated) or "+ New entry" (blank).
+                 Submits PATCH for existing rows, POST for new. -->
+            <div id="memRowModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:1000;align-items:center;justify-content:center;">
+                <div style="background:var(--ink);border:1px solid var(--rule);max-width:760px;width:92vw;max-height:90vh;overflow:auto;padding:22px;font-family:var(--font-mono);">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <h3 id="memModalTitle" style="margin:0;font-family:var(--font-mono);">Edit memory row</h3>
+                        <button class="toggle-btn" id="memModalCloseBtn" style="font-size:11px;">Close</button>
+                    </div>
+                    <div id="memModalScope" style="color:var(--paper-faint);font-size:11px;margin-bottom:14px;"></div>
+
+                    <div style="display:grid;grid-template-columns:140px 1fr;gap:10px 14px;align-items:center;font-size:12px;">
+                        <label>type</label>
+                        <select id="memEditType" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+                            <option>desire</option><option>event</option><option>fact</option>
+                            <option>rule</option><option>relationship</option><option>trait</option>
+                            <option>place</option><option>possession</option><option>body</option>
+                            <option>secret</option>
+                        </select>
+
+                        <label>subject</label>
+                        <input id="memEditSubject" type="text" placeholder="user / self / npc_key / null" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label>intensity (1-6)</label>
+                        <input id="memEditIntensity" type="number" min="1" max="6" placeholder="(blank = none)" style="width:120px;padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label>importance (1-5)</label>
+                        <input id="memEditImportance" type="number" min="1" max="5" value="3" style="width:120px;padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label>status</label>
+                        <select id="memEditStatus" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+                            <option>active</option><option>dormant</option><option>resolved</option>
+                            <option>mutated</option><option>contradicted</option>
+                        </select>
+
+                        <label style="align-self:start;padding-top:6px;">content</label>
+                        <textarea id="memEditContent" rows="6" style="padding:8px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;resize:vertical;"></textarea>
+
+                        <label>tags</label>
+                        <input id="memEditTags" type="text" placeholder="comma,separated" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label style="align-self:start;padding-top:6px;">metadata (JSON)</label>
+                        <textarea id="memEditMetadata" rows="4" placeholder='{}' style="padding:8px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:11px;resize:vertical;"></textarea>
+                    </div>
+
+                    <div id="memModalError" style="margin-top:10px;color:var(--warn,#c44);font-size:12px;display:none;"></div>
+
+                    <div style="margin-top:18px;display:flex;justify-content:flex-end;gap:8px;">
+                        <button class="toggle-btn" id="memModalCancelBtn">Cancel</button>
+                        <button class="toggle-btn" id="memModalSaveBtn" style="border-color:var(--accent,#7aa);color:var(--accent,#7aa);">Save</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1490,8 +1535,21 @@
         }
 
         // ===== Character Memory v2 GUI =====
+        // memCurrentChar — selected character key (always the main one; NPCs
+        //   live as sub-folders under this).
+        // memCurrentData — the full payload from /api/memory/<char>: rows,
+        //   needs, npcs, card_seed, latest_turn.
+        // memCurrentEntity — null when viewing the main character's rows;
+        //   else an npc_key (string) when viewing one of the NPC sub-DBs.
+        //   Drives the entity-pill highlight + which API endpoints we hit
+        //   for table fetch / edit / insert / delete / move.
+        // memEntityRows — rows for the currently-scoped entity. For main
+        //   it's memCurrentData.memories. For an NPC it's fetched from
+        //   /api/memory/<char>/npc/<key> and cached here.
         let memCurrentChar = null;
         let memCurrentData = null;
+        let memCurrentEntity = null;
+        let memEntityRows = [];
 
         async function memLoadCharList() {
             const resp = await fetch('/api/memory/list');
@@ -1554,6 +1612,8 @@
             if (!charKey) {
                 memCurrentChar = null;
                 memCurrentData = null;
+                memCurrentEntity = null;
+                memEntityRows = [];
                 document.getElementById('memBody').style.display = 'none';
                 document.getElementById('memCharSummary').textContent = '';
                 return;
@@ -1566,22 +1626,79 @@
             const data = await resp.json();
             memCurrentChar = charKey;
             memCurrentData = data;
+            // Reset to main entity on character switch — sticky entity across
+            // characters would surprise the user.
+            memCurrentEntity = null;
             document.getElementById('memBody').style.display = 'block';
             const npcCount = (data.npcs || []).length;
             const seedFlag = data.card_seed ? ' · seeded' : '';
             document.getElementById('memCharSummary').textContent =
                 `${data.memories.length} memories · ${npcCount} NPCs · turn ${data.latest_turn}${seedFlag}`;
 
-            memPopulateTypeFilter(data.memories);
-            memRenderTable();
+            memRenderEntityPills();
+            await memScopeToEntity(null);
             memRenderNeeds(data.needs);
             memRenderNpcs(data.npcs);
             memRenderSeed(data.card_seed);
             memRenderErrors();
         }
 
-        function memPopulateTypeFilter(memories) {
-            const types = Array.from(new Set(memories.map(m => m.type))).sort();
+        // Render the entity-pill row (Main · NPC1 · NPC2 ...). Highlights
+        // whichever entity is currently scoped. Clicking a pill calls
+        // memScopeToEntity which re-fetches the table for that DB.
+        function memRenderEntityPills() {
+            const wrap = document.getElementById('memEntityPills');
+            if (!wrap) return;
+            wrap.innerHTML = '';
+            const npcs = (memCurrentData && memCurrentData.npcs) || [];
+            const entities = [{key: null, label: 'Main'}].concat(
+                npcs.map(n => ({key: n.npc_key, label: n.name || n.npc_key}))
+            );
+            entities.forEach(e => {
+                const btn = document.createElement('button');
+                btn.className = 'toggle-btn';
+                btn.style.fontSize = '11px';
+                btn.style.padding = '4px 10px';
+                btn.textContent = e.label;
+                if ((memCurrentEntity || null) === (e.key || null)) {
+                    btn.classList.add('active');
+                }
+                btn.onclick = () => memScopeToEntity(e.key);
+                wrap.appendChild(btn);
+            });
+        }
+
+        // Switch the Memories sub-tab to look at a specific entity's DB.
+        // entityKey === null means the main character; otherwise it's an
+        // npc_key. Fetches that entity's rows (NPC rows come from the NPC
+        // endpoint, main rows are already loaded with the character).
+        async function memScopeToEntity(entityKey) {
+            if (!memCurrentChar) return;
+            memCurrentEntity = entityKey || null;
+            if (memCurrentEntity === null) {
+                memEntityRows = (memCurrentData && memCurrentData.memories) || [];
+            } else {
+                try {
+                    const resp = await fetch(
+                        `/api/memory/${encodeURIComponent(memCurrentChar)}/npc/${encodeURIComponent(memCurrentEntity)}`
+                    );
+                    if (!resp.ok) {
+                        memEntityRows = [];
+                    } else {
+                        const data = await resp.json();
+                        memEntityRows = data.memories || [];
+                    }
+                } catch (_) {
+                    memEntityRows = [];
+                }
+            }
+            memRenderEntityPills();
+            memPopulateTypeFilter(memEntityRows);
+            memRenderTable();
+        }
+
+        function memPopulateTypeFilter(rows) {
+            const types = Array.from(new Set(rows.map(m => m.type))).sort();
             const sel = document.getElementById('memFilterType');
             const prev = sel.value;
             sel.innerHTML = '<option value="">all types</option>';
@@ -1599,7 +1716,7 @@
             const ftype = document.getElementById('memFilterType').value;
             const fstatus = document.getElementById('memFilterStatus').value;
             const ftext = document.getElementById('memFilterText').value.toLowerCase();
-            let rows = memCurrentData.memories.slice();
+            let rows = memEntityRows.slice();
             if (ftype) rows = rows.filter(r => r.type === ftype);
             if (fstatus) rows = rows.filter(r => r.status === fstatus);
             if (ftext) rows = rows.filter(r => (r.content || '').toLowerCase().includes(ftext));
@@ -1610,7 +1727,9 @@
                 if (b.importance !== a.importance) return b.importance - a.importance;
                 return b.id - a.id;
             });
-            document.getElementById('memRowCount').textContent = `${rows.length} of ${memCurrentData.memories.length}`;
+            const scopeLabel = memCurrentEntity ? `NPC[${memCurrentEntity}]` : 'main';
+            document.getElementById('memRowCount').textContent =
+                `${rows.length} of ${memEntityRows.length} (${scopeLabel})`;
             const tbody = document.getElementById('memTableBody');
             tbody.innerHTML = '';
             rows.forEach(r => {
@@ -1620,17 +1739,31 @@
                 tr.innerHTML = `
                     <td style="padding:6px 8px;color:var(--paper-faint);">${r.id}</td>
                     <td style="padding:6px 8px;">${r.type}</td>
-                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.subject || '-'}</td>
+                    <td style="padding:6px 8px;color:var(--paper-faint);">${escapeHtml(r.subject || '-')}</td>
                     <td style="padding:6px 8px;">${r.intensity ?? ''}</td>
                     <td style="padding:6px 8px;">${r.importance}</td>
                     <td style="padding:6px 8px;color:var(--paper-faint);">${r.status}</td>
                     <td style="padding:6px 8px;">${escapeHtml(r.content || '')}</td>
                     <td style="padding:6px 8px;color:var(--paper-faint);">${r.created_turn}</td>
-                    <td style="padding:6px 8px;">
-                        <button class="toggle-btn" style="padding:3px 8px;font-size:10px;" onclick="memDeleteRow(${r.id})">×</button>
+                    <td style="padding:6px 8px;white-space:nowrap;">
+                        <button class="toggle-btn memEditBtn" style="padding:3px 8px;font-size:10px;" data-id="${r.id}">edit</button>
+                        <button class="toggle-btn memMoveBtn" style="padding:3px 8px;font-size:10px;" data-id="${r.id}">move ▾</button>
+                        <button class="toggle-btn memDeleteBtn" style="padding:3px 8px;font-size:10px;border-color:var(--warn,#c44);color:var(--warn,#c44);" data-id="${r.id}">×</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
+            });
+            // Wire row-action buttons. Using delegation-via-class is fine here
+            // because the table is fully re-rendered each time and there are
+            // no leftover stale listeners.
+            tbody.querySelectorAll('.memEditBtn').forEach(b => {
+                b.addEventListener('click', () => memOpenEditModal(parseInt(b.dataset.id, 10)));
+            });
+            tbody.querySelectorAll('.memMoveBtn').forEach(b => {
+                b.addEventListener('click', e => memShowMoveMenu(e.currentTarget, parseInt(b.dataset.id, 10)));
+            });
+            tbody.querySelectorAll('.memDeleteBtn').forEach(b => {
+                b.addEventListener('click', () => memDeleteRow(parseInt(b.dataset.id, 10)));
             });
         }
 
@@ -1641,10 +1774,223 @@
                 .replace(/>/g, '&gt;');
         }
 
+        // Build the ?npc=... query suffix used by the row endpoints. Empty
+        // string when the main DB is in scope.
+        function memScopeQuery() {
+            return memCurrentEntity ? ('?npc=' + encodeURIComponent(memCurrentEntity)) : '';
+        }
+
         async function memDeleteRow(id) {
             if (!confirm(`Delete memory row ${id}?`)) return;
-            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/row/${id}`, {method: 'DELETE'});
-            if (resp.ok) memLoadChar(memCurrentChar);
+            const resp = await fetch(
+                `/api/memory/${encodeURIComponent(memCurrentChar)}/row/${id}${memScopeQuery()}`,
+                {method: 'DELETE'}
+            );
+            if (resp.ok) {
+                await memReloadCurrentScope();
+            }
+        }
+
+        // Reload the rows for whatever entity is currently scoped, plus the
+        // top-level summary numbers. Cheaper than memLoadChar because it
+        // skips the needs/seed/errors panels.
+        async function memReloadCurrentScope() {
+            if (!memCurrentChar) return;
+            // Refresh main-char data (counts + main rows) then re-scope.
+            const resp = await fetch('/api/memory/' + encodeURIComponent(memCurrentChar));
+            if (resp.ok) {
+                memCurrentData = await resp.json();
+                const npcCount = (memCurrentData.npcs || []).length;
+                const seedFlag = memCurrentData.card_seed ? ' · seeded' : '';
+                document.getElementById('memCharSummary').textContent =
+                    `${memCurrentData.memories.length} memories · ${npcCount} NPCs · turn ${memCurrentData.latest_turn}${seedFlag}`;
+                memRenderEntityPills();
+            }
+            await memScopeToEntity(memCurrentEntity);
+        }
+
+        // ----- Edit / Insert modal -----
+        // memModalRowId is null when adding a new entry, otherwise the id
+        // of the row being patched. Determines whether Save fires PATCH or POST.
+        let memModalRowId = null;
+
+        function memOpenEditModal(rowId) {
+            const row = memEntityRows.find(r => r.id === rowId);
+            if (!row) return;
+            memModalRowId = rowId;
+            document.getElementById('memModalTitle').textContent = `Edit row ${rowId}`;
+            const scopeLabel = memCurrentEntity ? `NPC[${memCurrentEntity}]` : 'main character';
+            document.getElementById('memModalScope').textContent =
+                `Scope: ${scopeLabel} · created turn ${row.created_turn}`;
+            document.getElementById('memEditType').value = row.type || 'fact';
+            document.getElementById('memEditSubject').value = row.subject || '';
+            document.getElementById('memEditIntensity').value = row.intensity == null ? '' : row.intensity;
+            document.getElementById('memEditImportance').value = row.importance ?? 3;
+            document.getElementById('memEditStatus').value = row.status || 'active';
+            document.getElementById('memEditContent').value = row.content || '';
+            document.getElementById('memEditTags').value = row.tags || '';
+            document.getElementById('memEditMetadata').value =
+                row.metadata == null ? '' : JSON.stringify(row.metadata, null, 2);
+            document.getElementById('memModalError').style.display = 'none';
+            document.getElementById('memRowModal').style.display = 'flex';
+        }
+
+        function memOpenInsertModal() {
+            if (!memCurrentChar) {
+                alert('Select a character first.');
+                return;
+            }
+            memModalRowId = null;
+            document.getElementById('memModalTitle').textContent = 'New memory row';
+            const scopeLabel = memCurrentEntity ? `NPC[${memCurrentEntity}]` : 'main character';
+            document.getElementById('memModalScope').textContent = `Scope: ${scopeLabel}`;
+            document.getElementById('memEditType').value = 'fact';
+            document.getElementById('memEditSubject').value = '';
+            document.getElementById('memEditIntensity').value = '';
+            document.getElementById('memEditImportance').value = 3;
+            document.getElementById('memEditStatus').value = 'active';
+            document.getElementById('memEditContent').value = '';
+            document.getElementById('memEditTags').value = '';
+            document.getElementById('memEditMetadata').value = '';
+            document.getElementById('memModalError').style.display = 'none';
+            document.getElementById('memRowModal').style.display = 'flex';
+        }
+
+        function memCloseModal() {
+            document.getElementById('memRowModal').style.display = 'none';
+            memModalRowId = null;
+        }
+
+        // Pull values out of the modal form into a payload dict suitable for
+        // PATCH or POST. Returns null and surfaces the error in the modal
+        // when the metadata JSON is malformed.
+        function memBuildPayloadFromModal() {
+            const errEl = document.getElementById('memModalError');
+            errEl.style.display = 'none';
+
+            const intensityRaw = document.getElementById('memEditIntensity').value.trim();
+            const subjectRaw = document.getElementById('memEditSubject').value.trim();
+            const tagsRaw = document.getElementById('memEditTags').value.trim();
+            const metadataRaw = document.getElementById('memEditMetadata').value.trim();
+
+            let metadata = null;
+            if (metadataRaw) {
+                try { metadata = JSON.parse(metadataRaw); }
+                catch (e) {
+                    errEl.textContent = 'metadata is not valid JSON: ' + e.message;
+                    errEl.style.display = 'block';
+                    return null;
+                }
+            }
+
+            const payload = {
+                type: document.getElementById('memEditType').value,
+                content: document.getElementById('memEditContent').value,
+                importance: parseInt(document.getElementById('memEditImportance').value, 10) || 3,
+                status: document.getElementById('memEditStatus').value,
+            };
+            if (subjectRaw) payload.subject = subjectRaw; else payload.subject = null;
+            if (intensityRaw) payload.intensity = parseInt(intensityRaw, 10);
+            if (tagsRaw) payload.tags = tagsRaw;
+            if (metadata !== null) payload.metadata = metadata;
+            return payload;
+        }
+
+        async function memSaveModal() {
+            if (!memCurrentChar) return;
+            const payload = memBuildPayloadFromModal();
+            if (!payload) return;
+            const errEl = document.getElementById('memModalError');
+            const url = memModalRowId == null
+                ? `/api/memory/${encodeURIComponent(memCurrentChar)}/row${memScopeQuery()}`
+                : `/api/memory/${encodeURIComponent(memCurrentChar)}/row/${memModalRowId}${memScopeQuery()}`;
+            const method = memModalRowId == null ? 'POST' : 'PATCH';
+            const resp = await fetch(url, {
+                method,
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            if (!resp.ok) {
+                let msg = `${method} failed: HTTP ${resp.status}`;
+                try { const d = await resp.json(); if (d.error) msg = d.error; } catch (_) {}
+                errEl.textContent = msg;
+                errEl.style.display = 'block';
+                return;
+            }
+            memCloseModal();
+            await memReloadCurrentScope();
+        }
+
+        // ----- Move row dropdown -----
+        // Anchors a tiny menu next to the clicked button listing every entity
+        // OTHER than the row's current scope. Click an entry → POST move.
+        function memShowMoveMenu(anchor, rowId) {
+            // Tear down any prior menu.
+            const prior = document.getElementById('memMoveMenu');
+            if (prior) prior.remove();
+
+            const npcs = (memCurrentData && memCurrentData.npcs) || [];
+            const targets = [{key: null, label: 'Main character'}].concat(
+                npcs.map(n => ({key: n.npc_key, label: `NPC: ${n.name || n.npc_key}`}))
+            ).filter(t => (t.key || null) !== (memCurrentEntity || null));
+
+            const menu = document.createElement('div');
+            menu.id = 'memMoveMenu';
+            menu.style.cssText = 'position:absolute;background:var(--ink);border:1px solid var(--rule);padding:4px;z-index:500;font-family:var(--font-mono);font-size:11px;min-width:180px;';
+            const rect = anchor.getBoundingClientRect();
+            menu.style.top = (rect.bottom + window.scrollY + 2) + 'px';
+            menu.style.left = (rect.left + window.scrollX) + 'px';
+
+            if (targets.length === 0) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'padding:6px 10px;color:var(--paper-faint);';
+                empty.textContent = '(no other entities to move to)';
+                menu.appendChild(empty);
+            } else {
+                targets.forEach(t => {
+                    const item = document.createElement('div');
+                    item.style.cssText = 'padding:6px 10px;cursor:pointer;color:var(--paper);';
+                    item.textContent = t.label;
+                    item.onmouseover = () => item.style.background = 'var(--ink-sunk)';
+                    item.onmouseout = () => item.style.background = '';
+                    item.onclick = () => { menu.remove(); memMoveRow(rowId, t.key); };
+                    menu.appendChild(item);
+                });
+            }
+
+            document.body.appendChild(menu);
+
+            // Click-away dismisses. Defer until next tick so the spawning click
+            // doesn't immediately close it.
+            setTimeout(() => {
+                const dismiss = (ev) => {
+                    if (!menu.contains(ev.target)) {
+                        menu.remove();
+                        document.removeEventListener('click', dismiss);
+                    }
+                };
+                document.addEventListener('click', dismiss);
+            }, 0);
+        }
+
+        async function memMoveRow(rowId, targetNpcKey) {
+            const resp = await fetch(
+                `/api/memory/${encodeURIComponent(memCurrentChar)}/row/${rowId}/move${memScopeQuery()}`,
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({to_npc: targetNpcKey}),
+                }
+            );
+            if (!resp.ok) {
+                let msg = `move failed: HTTP ${resp.status}`;
+                try { const d = await resp.json(); if (d.error) msg = d.error; } catch (_) {}
+                alert(msg);
+                return;
+            }
+            const data = await resp.json();
+            if (data.warning) alert('Warning: ' + data.warning);
+            await memReloadCurrentScope();
         }
 
         function memRenderNeeds(needs) {
@@ -1700,7 +2046,6 @@
         function memRenderNpcs(npcs) {
             const body = document.getElementById('memNpcsBody');
             body.innerHTML = '';
-            document.getElementById('memNpcDetail').style.display = 'none';
             if (!npcs || npcs.length === 0) {
                 body.textContent = 'No NPCs registered yet.';
                 return;
@@ -1708,45 +2053,108 @@
             npcs.forEach(n => {
                 const card = document.createElement('div');
                 card.className = 'setting-card';
-                card.style.cssText = 'cursor:pointer;margin-bottom:8px;';
+                card.style.cssText = 'margin-bottom:10px;';
+                const aliasesStr = (n.aliases || []).join(', ');
                 card.innerHTML = `
-                    <div style="display:flex;justify-content:space-between;align-items:center;">
-                        <div>
-                            <strong>${escapeHtml(n.name || n.npc_key)}</strong>
-                            <span style="color:var(--paper-faint);font-size:11px;font-family:var(--font-mono);margin-left:8px;">[${n.npc_key}]</span>
-                            <span style="color:var(--paper-faint);font-size:11px;margin-left:8px;">status: ${n.status || 'active'}, introduced turn ${n.introduced_at_turn ?? '?'}</span>
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;">
+                        <div style="flex:1;min-width:240px;">
+                            <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;">
+                                <strong>${escapeHtml(n.name || n.npc_key)}</strong>
+                                <span style="color:var(--paper-faint);font-size:11px;font-family:var(--font-mono);">[${n.npc_key}]</span>
+                                <span style="color:var(--paper-faint);font-size:11px;">introduced turn ${n.introduced_at_turn ?? '?'}</span>
+                            </div>
                         </div>
-                        <span style="color:var(--paper-faint);font-size:11px;">click to inspect</span>
+                        <div style="display:flex;gap:6px;">
+                            <button class="toggle-btn npcViewMemBtn" style="font-size:11px;" data-key="${n.npc_key}">View memories</button>
+                        </div>
                     </div>
-                    <div style="color:var(--paper-faint);font-size:12px;margin-top:6px;">${escapeHtml((n.bio || '').slice(0, 200))}${(n.bio || '').length > 200 ? '...' : ''}</div>
+                    <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 12px;margin-top:10px;font-family:var(--font-mono);font-size:12px;align-items:center;">
+                        <label>name</label>
+                        <input type="text" class="npcCardName" data-key="${n.npc_key}" value="${escapeHtml(n.name || '')}" style="padding:5px 8px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label>status</label>
+                        <select class="npcCardStatus" data-key="${n.npc_key}" style="padding:5px 8px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;width:160px;">
+                            <option value="active"${(n.status || 'active') === 'active' ? ' selected' : ''}>active</option>
+                            <option value="dismissed"${n.status === 'dismissed' ? ' selected' : ''}>dismissed</option>
+                            <option value="pending"${n.status === 'pending' ? ' selected' : ''}>pending</option>
+                        </select>
+
+                        <label>aliases</label>
+                        <input type="text" class="npcCardAliases" data-key="${n.npc_key}" value="${escapeHtml(aliasesStr)}" placeholder="comma-separated" style="padding:5px 8px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label style="align-self:start;padding-top:4px;">bio</label>
+                        <textarea class="npcCardBio" data-key="${n.npc_key}" rows="3" style="padding:6px 8px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;resize:vertical;">${escapeHtml(n.bio || '')}</textarea>
+                    </div>
+                    <div style="margin-top:10px;display:flex;gap:6px;align-items:center;">
+                        <button class="toggle-btn npcCardSaveBtn" style="font-size:11px;" data-key="${n.npc_key}">Save card</button>
+                        <span class="npcCardStatusMsg" data-key="${n.npc_key}" style="font-size:11px;color:var(--paper-faint);"></span>
+                    </div>
                 `;
-                card.onclick = () => memLoadNpc(n.npc_key);
                 body.appendChild(card);
+            });
+            // Wire view-memories deep-link buttons.
+            body.querySelectorAll('.npcViewMemBtn').forEach(b => {
+                b.addEventListener('click', () => memViewNpcMemories(b.dataset.key));
+            });
+            // Wire card-save buttons.
+            body.querySelectorAll('.npcCardSaveBtn').forEach(b => {
+                b.addEventListener('click', () => memSaveNpcCard(b.dataset.key));
             });
         }
 
-        async function memLoadNpc(npcKey) {
-            const resp = await fetch(`/api/memory/${encodeURIComponent(memCurrentChar)}/npc/${encodeURIComponent(npcKey)}`);
-            if (!resp.ok) return;
-            const data = await resp.json();
-            const det = document.getElementById('memNpcDetail');
-            det.style.display = 'block';
-            document.getElementById('memNpcDetailTitle').textContent = `${data.card.name} [${npcKey}]`;
-            document.getElementById('memNpcDetailMeta').textContent =
-                `status: ${data.card.status}, introduced turn ${data.card.introduced_at_turn}, ${data.memories.length} memories, ${data.card.seeded ? 'seeded' : 'not seeded'}`;
-            const tbody = document.getElementById('memNpcDetailRows');
-            tbody.innerHTML = '';
-            data.memories.forEach(r => {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.id}</td>
-                    <td style="padding:6px 8px;">${r.type}</td>
-                    <td style="padding:6px 8px;color:var(--paper-faint);">${r.subject || '-'}</td>
-                    <td style="padding:6px 8px;">${r.importance}</td>
-                    <td style="padding:6px 8px;">${escapeHtml(r.content || '')}</td>
-                `;
-                tbody.appendChild(tr);
-            });
+        // Save the NPC card metadata. Reads the form fields scoped to that
+        // NPC's npc_key (data-key attribute), PATCHes the card endpoint,
+        // refreshes the NPC list to reflect the new state.
+        async function memSaveNpcCard(npcKey) {
+            if (!memCurrentChar) return;
+            const sel = (cls) => document.querySelector(`.${cls}[data-key="${CSS.escape(npcKey)}"]`);
+            const aliasesStr = sel('npcCardAliases').value;
+            const aliases = aliasesStr.split(',').map(s => s.trim()).filter(Boolean);
+            const payload = {
+                name: sel('npcCardName').value.trim(),
+                status: sel('npcCardStatus').value,
+                aliases,
+                bio: sel('npcCardBio').value,
+            };
+            const statusEl = sel('npcCardStatusMsg') || document.querySelector(`.npcCardStatusMsg[data-key="${CSS.escape(npcKey)}"]`);
+            const resp = await fetch(
+                `/api/memory/${encodeURIComponent(memCurrentChar)}/npc/${encodeURIComponent(npcKey)}/card`,
+                {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload),
+                }
+            );
+            if (!resp.ok) {
+                let msg = `save failed: HTTP ${resp.status}`;
+                try { const d = await resp.json(); if (d.error) msg = d.error; } catch (_) {}
+                if (statusEl) {
+                    statusEl.textContent = msg;
+                    statusEl.style.color = 'var(--warn,#c44)';
+                }
+                return;
+            }
+            if (statusEl) {
+                statusEl.textContent = 'saved.';
+                statusEl.style.color = 'var(--success,#7a7)';
+                setTimeout(() => { statusEl.textContent = ''; }, 2000);
+            }
+            // Re-fetch char data so the NPC name change propagates to the
+            // Memories sub-tab's entity pills.
+            await memReloadCurrentScope();
+        }
+
+        // "View memories" deep-link: switch to the Memories sub-tab and scope
+        // it to the chosen NPC. Mirrors the user clicking the NPC's pill but
+        // saves them the round-trip.
+        async function memViewNpcMemories(npcKey) {
+            // Activate the Memories sub-tab button.
+            document.querySelectorAll('[data-memtab]').forEach(b => b.classList.remove('active'));
+            const memTabBtn = document.querySelector('[data-memtab="memories"]');
+            if (memTabBtn) memTabBtn.classList.add('active');
+            document.querySelectorAll('.memSubPanel').forEach(p => p.style.display = 'none');
+            document.getElementById('memSub_memories').style.display = 'block';
+            await memScopeToEntity(npcKey);
         }
 
         function memRenderSeed(seed) {
@@ -1793,6 +2201,25 @@
             });
             const saveNeedsBtn = document.getElementById('memNeedsSaveBtn');
             if (saveNeedsBtn) saveNeedsBtn.addEventListener('click', memSaveNeeds);
+            // "+ New entry" button at top of the Memories sub-tab opens a
+            // blank modal scoped to whatever entity is currently selected.
+            const addBtn = document.getElementById('memAddRowBtn');
+            if (addBtn) addBtn.addEventListener('click', memOpenInsertModal);
+            // Modal close / cancel / save wiring.
+            const modalClose = document.getElementById('memModalCloseBtn');
+            if (modalClose) modalClose.addEventListener('click', memCloseModal);
+            const modalCancel = document.getElementById('memModalCancelBtn');
+            if (modalCancel) modalCancel.addEventListener('click', memCloseModal);
+            const modalSave = document.getElementById('memModalSaveBtn');
+            if (modalSave) modalSave.addEventListener('click', memSaveModal);
+            // Click outside modal content to dismiss. We attach to the overlay
+            // and check the target — clicks inside the inner card don't bubble.
+            const modalOverlay = document.getElementById('memRowModal');
+            if (modalOverlay) {
+                modalOverlay.addEventListener('click', e => {
+                    if (e.target === modalOverlay) memCloseModal();
+                });
+            }
             // Sub-tab switching within Memory panel
             document.querySelectorAll('[data-memtab]').forEach(btn => {
                 btn.addEventListener('click', () => {

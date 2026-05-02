@@ -516,6 +516,67 @@ def get_memory(conn: sqlite3.Connection, memory_id: int) -> Optional[dict]:
     return _row_to_dict(row) if row else None
 
 
+def move_memory(
+    char_key: str,
+    row_id: int,
+    source_npc_key: Optional[str] = None,
+    target_npc_key: Optional[str] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """Move a memory row from one DB to another within the same character.
+
+    `source_npc_key` / `target_npc_key`: None = main character DB, otherwise
+    the NPC sub-DB. Returns (new_id, error_or_None). Preserves created_turn,
+    last_seen_turn, last_acted_turn — those are facts about when the row was
+    originally written, and shouldn't shift just because the user moved it.
+
+    Atomicity: the insert into the target runs first, then the delete from
+    the source. If the insert fails, the source row is preserved untouched.
+    If the delete somehow fails after a successful insert (rare on SQLite),
+    the row exists in both DBs and the user can manually clean up — flagged
+    in the error string. We don't wrap both in a single transaction because
+    they're separate connections.
+    """
+    if (source_npc_key or None) == (target_npc_key or None):
+        return None, "source and target are the same"
+
+    src_conn = get_connection(char_key, npc_key=source_npc_key) if source_npc_key else get_connection(char_key)
+    if src_conn is None:
+        return None, "source DB not found"
+    tgt_conn = get_connection(char_key, npc_key=target_npc_key) if target_npc_key else get_connection(char_key)
+    if tgt_conn is None:
+        return None, "target DB not found"
+
+    row = get_memory(src_conn, row_id)
+    if not row:
+        return None, "row not found in source"
+
+    try:
+        new_id = insert_memory(
+            tgt_conn,
+            type=row["type"],
+            content=row["content"],
+            subject=row.get("subject"),
+            intensity=row.get("intensity"),
+            importance=row.get("importance", 3),
+            created_turn=row.get("created_turn", 0),
+            last_seen_turn=row.get("last_seen_turn"),
+            last_acted_turn=row.get("last_acted_turn"),
+            status=row.get("status", "active"),
+            tags=row.get("tags"),
+            metadata=row.get("metadata"),
+            embedding=row.get("embedding"),
+        )
+    except (ValueError, TypeError, sqlite3.Error) as e:
+        return None, f"insert into target failed: {e}"
+
+    try:
+        src_conn.execute("DELETE FROM memories WHERE id = ?", (int(row_id),))
+    except sqlite3.Error as e:
+        return new_id, f"inserted into target as id={new_id} but failed to delete from source: {e}"
+
+    return new_id, None
+
+
 def query_memories(
     conn: sqlite3.Connection,
     *,
@@ -1447,6 +1508,41 @@ def save_npc_card(char_key: str, npc_key: str, card: dict):
         log(f"failed to save npc_card.json at {p}: {e}", "WARN")
 
 
+_NPC_CARD_EDITABLE_FIELDS = {"name", "bio", "aliases", "status"}
+
+
+def update_npc_card(char_key: str, npc_key: str, fields: dict) -> tuple[bool, Optional[str]]:
+    """Patch the editable subset of an NPC card. Returns (ok, error_or_None).
+
+    Editable fields: name, bio, aliases (list of strings), status. Anything
+    else in `fields` is silently dropped — we don't expose seeded /
+    seed_row_count / introduced_at_turn to the GUI because those are
+    bookkeeping the system maintains itself.
+    """
+    card = load_npc_card(char_key, npc_key)
+    if card is None:
+        return False, "NPC card not found"
+    changed = False
+    for k, v in (fields or {}).items():
+        if k not in _NPC_CARD_EDITABLE_FIELDS:
+            continue
+        if k == "aliases":
+            if not isinstance(v, list):
+                return False, "aliases must be a list of strings"
+            v = [str(a).strip() for a in v if str(a).strip()]
+        elif k == "status":
+            if v not in ("active", "dismissed", "pending"):
+                return False, f"invalid status: {v!r}"
+        elif k in ("name", "bio"):
+            v = str(v) if v is not None else ""
+        if card.get(k) != v:
+            card[k] = v
+            changed = True
+    if changed:
+        save_npc_card(char_key, npc_key, card)
+    return True, None
+
+
 def list_npcs(char_key: str) -> list[dict]:
     """Return all NPC cards under a character. Each dict gets `npc_key` injected."""
     cdir = char_dir(char_key)
@@ -1749,12 +1845,48 @@ def register_npc(
     return npc_key
 
 
-def find_npcs_in_scene(char_key: str, messages: list[dict], lookback: int = 4) -> list[str]:
-    """Return npc_keys whose name (or any alias) appears in the recent messages.
+_NPC_INJECTION_PREFIXES = ("<turn>", "<latest_turn", "[ooc", "(ooc")
+_NPC_INJECTION_SUBSTRINGS = (
+    "vital that author",
+    "past events:",
+    "story summary",
+    "=== story summary",
+)
 
-    Cheap word-boundary substring scan. Doesn't try to be smart about
-    pronouns or context — if "Marcus" appears in the last 4 messages, we
-    assume Marcus is in scene.
+
+def _is_injection_message(role: str, content: str) -> bool:
+    """True if this message looks like an ST tail-injection (persona, summary,
+    preset narrator marker, lorebook block, OOC note) rather than substantive
+    in-scene narrative. Used by find_npcs_in_scene to walk past the noise ST
+    piles at the end of the messages list."""
+    if role == "system":
+        return True
+    stripped = (content or "").strip()
+    if len(stripped) < 30:
+        return True
+    low = stripped.lower()
+    if any(low.startswith(p) for p in _NPC_INJECTION_PREFIXES):
+        return True
+    if any(s in low for s in _NPC_INJECTION_SUBSTRINGS):
+        return True
+    return False
+
+
+def find_npcs_in_scene(char_key: str, messages: list[dict], lookback: int = 2) -> list[str]:
+    """Return npc_keys whose name (or any alias) appears in the active scene.
+
+    Walks backwards through `messages`, skipping system-role injections and
+    known preset markers (Celia's `<latest_turn_end>` / `<turn>` / "Vital
+    that author", auto-summary "Past events:" blocks, OOC notes), and
+    collects the latest `lookback` substantive narrative messages. Then
+    word-boundary scans those for registered NPC names.
+
+    Why the filtering: ST piles tail injections (persona, lorebook entries,
+    preset narrator instructions, "Past events" summaries) at the end of
+    the messages list. A naive scan of the last N picks up Tuya from a
+    "Past events" summary even when she's not in the current scene, or
+    misses Khaemwaset because real narrative is two messages further back
+    than the bridge's `messages[-1]`.
     """
     npcs = list_npcs(char_key)
     if not npcs:
@@ -1764,16 +1896,28 @@ def find_npcs_in_scene(char_key: str, messages: list[dict], lookback: int = 4) -
     if not candidates:
         return []
 
-    # Concatenate recent message text.
+    # Walk backwards, skipping injection messages, collect lookback substantive ones.
     haystack_parts = []
-    for m in messages[-lookback:]:
+    debug_lines = []
+    for m in reversed(messages):
+        if len(haystack_parts) >= lookback:
+            break
+        role = m.get("role", "?")
         content = m.get("content", "")
         if isinstance(content, list):
             content = "\n".join(
                 p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
             )
-        if isinstance(content, str):
-            haystack_parts.append(content)
+        if not isinstance(content, str):
+            continue
+        if _is_injection_message(role, content):
+            debug_lines.append(f"  SKIP [{role}] {content.replace(chr(10),' ')[:120]}")
+            continue
+        haystack_parts.insert(0, content)
+        debug_lines.append(f"  KEEP [{role}] {content.replace(chr(10),' ')[:120]}")
+
+    log(f"find_npcs_in_scene[{char_key}] walked backwards (lookback={lookback}, kept {len(haystack_parts)}):\n" + "\n".join(debug_lines), "INFO")
+
     haystack = " ".join(haystack_parts).lower()
     if not haystack.strip():
         return []
