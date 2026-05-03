@@ -28,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -3930,6 +3930,17 @@ def memory_delete_npc(char_key, npc_key):
     if not ok:
         return jsonify({"error": err or "delete failed"}), 400
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/memory/<char_key>/label", methods=["PATCH"])
+def memory_set_label(char_key):
+    """Set or clear the user-facing display label for a character.
+    Body: {"label": "Ramesses-II"} or {"label": ""} to clear."""
+    data = request.json or {}
+    ok = memory_v2.save_label(char_key, data.get("label", ""))
+    if not ok:
+        return jsonify({"error": "save failed"}), 400
+    return jsonify({"status": "ok", "label": memory_v2.load_label(char_key)})
 
 
 @app.route("/api/memory/<char_key>/row", methods=["POST"])

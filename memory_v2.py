@@ -3253,6 +3253,45 @@ def delete_npc(char_key: str, npc_key: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def _label_path(char_key: str) -> Optional[str]:
+    cdir = char_dir(char_key)
+    return os.path.join(cdir, "label.json") if cdir else None
+
+
+def load_label(char_key: str) -> str:
+    """Read the user-set display label for a character. Returns '' when
+    no label has been set yet."""
+    p = _label_path(char_key)
+    if not p or not os.path.exists(p):
+        return ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return (json.load(f).get("label") or "").strip()
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def save_label(char_key: str, label: str) -> bool:
+    """Write the user-set display label for a character. Empty string clears
+    the label (file is removed)."""
+    p = _label_path(char_key)
+    if not p:
+        return False
+    label = (label or "").strip()
+    try:
+        if not label:
+            if os.path.exists(p):
+                os.remove(p)
+            return True
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"label": label}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as e:
+        log(f"save_label[{char_key}] failed: {e}", "WARN")
+        return False
+
+
 def list_characters() -> list[dict]:
     """Return summary info for every character with a memory dir."""
     if not os.path.isdir(MEMORY_ROOT):
@@ -3265,6 +3304,7 @@ def list_characters() -> list[dict]:
         db_file = os.path.join(cdir, "memory.db")
         info = {
             "char_key": entry,
+            "label": load_label(entry),
             "has_db": os.path.exists(db_file),
             "has_needs": os.path.exists(os.path.join(cdir, "needs.json")),
             "has_card_seed": os.path.exists(os.path.join(cdir, "card_seed.json")),

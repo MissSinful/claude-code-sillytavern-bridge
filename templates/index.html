@@ -1340,6 +1340,7 @@
                         <option value="">— select a character —</option>
                     </select>
                     <button class="toggle-btn" id="memPinBtn">Pin</button>
+                    <button class="toggle-btn" id="memLabelBtn">Label</button>
                     <button class="toggle-btn" id="memRefreshBtn">Refresh</button>
                     <button class="toggle-btn" id="memResetBtn" style="border-color:var(--warn,#c44);color:var(--warn,#c44);">Reset</button>
                 </div>
@@ -1557,10 +1558,23 @@
             const sel = document.getElementById('memCharSelect');
             const prev = sel.value;
             sel.innerHTML = '<option value="">— select a character —</option>';
-            (data.characters || []).forEach(c => {
+            // Sort: labeled chars first (alpha by label), then unlabeled (by
+            // char_key). Makes named characters easy to find at a glance.
+            const chars = (data.characters || []).slice().sort((a, b) => {
+                const la = (a.label || '').toLowerCase();
+                const lb = (b.label || '').toLowerCase();
+                if (la && !lb) return -1;
+                if (lb && !la) return 1;
+                if (la && lb) return la < lb ? -1 : la > lb ? 1 : 0;
+                return a.char_key < b.char_key ? -1 : 1;
+            });
+            chars.forEach(c => {
                 const opt = document.createElement('option');
                 opt.value = c.char_key;
-                opt.textContent = `${c.char_key} (${c.memory_count} mem, ${c.npc_count} NPCs, turn ${c.latest_turn})`;
+                // Label gets prominent placement; char_key shown in parens
+                // so you can still verify the right slot is selected.
+                const prefix = c.label ? `${c.label} — ${c.char_key}` : c.char_key;
+                opt.textContent = `${prefix} (${c.memory_count} mem, ${c.npc_count} NPCs, turn ${c.latest_turn})`;
                 sel.appendChild(opt);
             });
             if (prev) {
@@ -1568,6 +1582,45 @@
                 if (sel.value === prev) memLoadChar(prev);
             }
             await memRefreshPinBanner();
+        }
+
+        // Set / edit / clear the user-facing label for the currently-selected
+        // character. Empty string clears. Persists via PATCH /label, then
+        // refreshes the dropdown so the new label appears immediately.
+        async function memEditLabel() {
+            if (!memCurrentChar) {
+                alert('Select a character first.');
+                return;
+            }
+            // Look up current label from the cached list (avoids an extra fetch).
+            const resp = await fetch('/api/memory/list');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const me = (data.characters || []).find(c => c.char_key === memCurrentChar);
+            const current = (me && me.label) || '';
+            const next = prompt(
+                `Set a display label for this character:\n\n` +
+                `char_key: ${memCurrentChar}\n` +
+                `current: ${current || '(none)'}\n\n` +
+                `Type the new label (empty to clear):`,
+                current
+            );
+            if (next === null) return;
+            const patchResp = await fetch(
+                `/api/memory/${encodeURIComponent(memCurrentChar)}/label`,
+                {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({label: next.trim()}),
+                }
+            );
+            if (!patchResp.ok) {
+                let msg = `save failed: HTTP ${patchResp.status}`;
+                try { const d = await patchResp.json(); if (d.error) msg = d.error; } catch (_) {}
+                alert(msg);
+                return;
+            }
+            await memLoadCharList();
         }
 
         async function memRefreshPinBanner() {
@@ -1632,8 +1685,19 @@
             document.getElementById('memBody').style.display = 'block';
             const npcCount = (data.npcs || []).length;
             const seedFlag = data.card_seed ? ' · seeded' : '';
+            // Pull label from the cached list so we can show it in the
+            // summary too. Cheap — list endpoint is already loaded.
+            let labelStr = '';
+            try {
+                const listResp = await fetch('/api/memory/list');
+                if (listResp.ok) {
+                    const listData = await listResp.json();
+                    const me = (listData.characters || []).find(c => c.char_key === charKey);
+                    if (me && me.label) labelStr = `${me.label} · `;
+                }
+            } catch (_) {}
             document.getElementById('memCharSummary').textContent =
-                `${data.memories.length} memories · ${npcCount} NPCs · turn ${data.latest_turn}${seedFlag}`;
+                `${labelStr}${data.memories.length} memories · ${npcCount} NPCs · turn ${data.latest_turn}${seedFlag}`;
 
             memRenderEntityPills();
             await memScopeToEntity(null);
@@ -2243,6 +2307,8 @@
             if (pin) pin.addEventListener('click', memPin);
             const unpin = document.getElementById('memUnpinBtn');
             if (unpin) unpin.addEventListener('click', memUnpin);
+            const label = document.getElementById('memLabelBtn');
+            if (label) label.addEventListener('click', memEditLabel);
             ['memFilterType', 'memFilterStatus', 'memFilterText'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.addEventListener('input', memRenderTable);
