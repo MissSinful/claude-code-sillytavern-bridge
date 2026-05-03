@@ -28,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -3919,6 +3919,16 @@ def memory_update_npc_card(char_key, npc_key):
     ok, err = memory_v2.update_npc_card(char_key, npc_key, data)
     if not ok:
         return jsonify({"error": err or "update failed"}), 400 if err else 500
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/memory/<char_key>/npc/<npc_key>", methods=["DELETE"])
+def memory_delete_npc(char_key, npc_key):
+    """Delete an NPC entirely: closes pool entry, removes sub-folder + DB +
+    card.json, prunes the pointer fact rows from the main DB."""
+    ok, err = memory_v2.delete_npc(char_key, npc_key)
+    if not ok:
+        return jsonify({"error": err or "delete failed"}), 400
     return jsonify({"status": "ok"})
 
 

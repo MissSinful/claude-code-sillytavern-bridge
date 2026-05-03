@@ -3189,6 +3189,70 @@ def reset_character(char_key: str) -> bool:
     return True
 
 
+def _close_pool_for_npc(char_key: str, npc_key: str):
+    """Close the pooled connection for one specific NPC under a character.
+
+    Mirrors _close_pool_for_char but scoped to a single NPC — needed before
+    rmtree of the NPC's folder on Windows, which won't release a file handle
+    until the SQLite connection is closed.
+    """
+    safe_c = safe_dirname(char_key) or ""
+    safe_n = safe_dirname(npc_key) or ""
+    if not safe_c or not safe_n:
+        return
+    key = f"{safe_c}::{safe_n}"
+    with _pool_lock:
+        conn = _pool.pop(key, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def delete_npc(char_key: str, npc_key: str) -> tuple[bool, Optional[str]]:
+    """Delete an NPC: close pool entry, rmtree their sub-folder, prune the
+    pointer fact rows from the main DB so the GUI / retrieval don't see
+    ghost references.
+
+    Returns (ok, error_or_None). Idempotent — deleting a non-existent NPC
+    returns (True, None) so the GUI can call it without checking first.
+    """
+    safe_n = safe_dirname(npc_key)
+    if not safe_n:
+        return False, "invalid npc_key"
+    ndir = npc_dir(char_key, npc_key)
+    if not ndir:
+        return False, "no NPC directory path"
+
+    # Close the NPC's connection first so Windows lets us rmtree the .db.
+    _close_pool_for_npc(char_key, npc_key)
+
+    if os.path.isdir(ndir):
+        try:
+            shutil.rmtree(ndir)
+        except OSError as e:
+            log(f"delete_npc[{char_key}/{npc_key}] rmtree failed: {e}", "ERROR")
+            return False, f"rmtree failed: {e}"
+
+    # Prune the pointer fact row(s) the main DB carries for this NPC. Without
+    # this, list_npcs() (which scans the npcs/ subfolder) won't show them but
+    # _candidate_pull might still surface stale subject=<npc_key> rows.
+    main_conn = get_connection(char_key)
+    if main_conn is not None:
+        try:
+            with transaction(main_conn):
+                main_conn.execute(
+                    "DELETE FROM memories WHERE type='fact' AND tags LIKE '%npc%' AND subject = ?",
+                    (safe_n,),
+                )
+        except sqlite3.Error as e:
+            log(f"delete_npc[{char_key}/{npc_key}] prune pointer rows failed: {e}", "WARN")
+
+    log(f"delete_npc[{char_key}/{npc_key}]: removed", "SUCCESS")
+    return True, None
+
+
 def list_characters() -> list[dict]:
     """Return summary info for every character with a memory dir."""
     if not os.path.isdir(MEMORY_ROOT):

@@ -1657,8 +1657,12 @@
             entities.forEach(e => {
                 const btn = document.createElement('button');
                 btn.className = 'toggle-btn';
-                btn.style.fontSize = '11px';
-                btn.style.padding = '4px 10px';
+                // Override the toggle-btn defaults: those use flex:1 1 0 +
+                // ellipsis truncation, which is right for tab rows but
+                // squeezes the entity pills into "MA…  HE…  IS…" when
+                // there are many NPCs. Pills should size to their own
+                // content and wrap.
+                btn.style.cssText = 'flex:0 0 auto;font-size:11px;padding:4px 10px;text-overflow:clip;overflow:visible;border-right:1px solid var(--rule);';
                 btn.textContent = e.label;
                 if ((memCurrentEntity || null) === (e.key || null)) {
                     btn.classList.add('active');
@@ -1792,11 +1796,11 @@
         }
 
         // Reload the rows for whatever entity is currently scoped, plus the
-        // top-level summary numbers. Cheaper than memLoadChar because it
-        // skips the needs/seed/errors panels.
+        // top-level summary numbers and the NPCs sub-tab. Cheaper than
+        // memLoadChar because it skips the needs / seed / errors panels.
         async function memReloadCurrentScope() {
             if (!memCurrentChar) return;
-            // Refresh main-char data (counts + main rows) then re-scope.
+            // Refresh main-char data (counts + main rows + NPC list) then re-scope.
             const resp = await fetch('/api/memory/' + encodeURIComponent(memCurrentChar));
             if (resp.ok) {
                 memCurrentData = await resp.json();
@@ -1805,6 +1809,9 @@
                 document.getElementById('memCharSummary').textContent =
                     `${memCurrentData.memories.length} memories · ${npcCount} NPCs · turn ${memCurrentData.latest_turn}${seedFlag}`;
                 memRenderEntityPills();
+                // Re-render the NPCs sub-tab too — it shows the same list,
+                // so a deletion / card-save needs to be reflected here.
+                memRenderNpcs(memCurrentData.npcs);
             }
             await memScopeToEntity(memCurrentEntity);
         }
@@ -2066,6 +2073,7 @@
                         </div>
                         <div style="display:flex;gap:6px;">
                             <button class="toggle-btn npcViewMemBtn" style="font-size:11px;" data-key="${n.npc_key}">View memories</button>
+                            <button class="toggle-btn npcDeleteBtn" style="font-size:11px;border-color:var(--warn,#c44);color:var(--warn,#c44);" data-key="${n.npc_key}" data-name="${escapeHtml(n.name || n.npc_key)}">Delete</button>
                         </div>
                     </div>
                     <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 12px;margin-top:10px;font-family:var(--font-mono);font-size:12px;align-items:center;">
@@ -2100,6 +2108,46 @@
             body.querySelectorAll('.npcCardSaveBtn').forEach(b => {
                 b.addEventListener('click', () => memSaveNpcCard(b.dataset.key));
             });
+            // Wire NPC-delete buttons.
+            body.querySelectorAll('.npcDeleteBtn').forEach(b => {
+                b.addEventListener('click', () => memDeleteNpc(b.dataset.key, b.dataset.name));
+            });
+        }
+
+        // Delete an NPC entirely. Closes the connection, rms the folder
+        // (memory.db + npc_card.json), prunes the pointer row from main.
+        // Two-step confirm because this is destructive — type the NPC's
+        // name to proceed. If the deleted NPC was the currently-scoped
+        // entity in the Memories tab, fall back to main.
+        async function memDeleteNpc(npcKey, displayName) {
+            if (!memCurrentChar) return;
+            const typed = prompt(
+                `Delete NPC "${displayName}" entirely?\n\n` +
+                `This wipes their memory.db, their card, and the pointer row in main. ` +
+                `Cannot be undone.\n\n` +
+                `Type the NPC name (${displayName}) to confirm:`
+            );
+            if (typed === null) return;
+            if (typed.trim() !== displayName) {
+                alert('Name did not match. NPC not deleted.');
+                return;
+            }
+            const resp = await fetch(
+                `/api/memory/${encodeURIComponent(memCurrentChar)}/npc/${encodeURIComponent(npcKey)}`,
+                {method: 'DELETE'}
+            );
+            if (!resp.ok) {
+                let msg = `delete failed: HTTP ${resp.status}`;
+                try { const d = await resp.json(); if (d.error) msg = d.error; } catch (_) {}
+                alert(msg);
+                return;
+            }
+            // If we were scoped to this NPC in the Memories tab, fall back
+            // to main so we don't try to fetch a now-deleted DB.
+            if (memCurrentEntity === npcKey) {
+                memCurrentEntity = null;
+            }
+            await memReloadCurrentScope();
         }
 
         // Save the NPC card metadata. Reads the form fields scoped to that
