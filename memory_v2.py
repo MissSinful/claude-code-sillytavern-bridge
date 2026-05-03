@@ -2515,6 +2515,27 @@ Some cards establish the AI as a NARRATOR (Celia, Director, Storyteller, etc.) r
 - Relationships are between the PROTAGONIST and the NPCs they meet, not between the narrator and anyone.
 - Narrator traits/rules in the seed (about voice, formatting, in-role behavior) stay as-is — they ARE the narrator's stable rules. Don't update them per turn.
 - You can tell it's a narrator card if seed entries say things like "must never insert herself", "co-author and narrator", "OOC mode", or similar meta-framing.
+
+NPCs HAVE THEIR OWN MEMORY DBs (important — most maintenance passes miss this):
+Every registered NPC has their own SQLite DB at character_memory/<char>/npcs/<npc_key>/memory.db. The main character's DB tracks what THIS character knows/feels/wants. The NPC's DB tracks what THE NPC knows/feels/wants. Without writes to the NPC DB, the NPC stays frozen at their initial seed forever and the system gradually loses fidelity to them as a separate entity.
+
+Route an op to an NPC's DB by adding `"npc": "<name or alias>"` to the op:
+  {"op": "insert", "type": "event", "subject": "user",
+   "content": "Marcus saw Morgan flinch when she heard Tom's name",
+   "importance": 4, "npc": "Marcus"}
+  {"op": "update", "id": 12, "intensity": 5, "npc": "Marcus"}
+  {"op": "resolve", "id": 7, "reason": "Marcus said it out loud", "npc": "Marcus"}
+
+Use the NPC's display name (or any alias) — the bridge resolves it to the right DB. The `id` in update/resolve/mutate refers to a row in THAT NPC's DB, not main.
+
+Routing rules:
+- Write to MAIN when the experience/perception/desire/need belongs to the active character (the protagonist).
+- Write to AN NPC's DB when the experience/perception/desire belongs to that NPC. "Marcus realized Morgan was lying" → event in Marcus's DB. "Marcus has decided he wants to take her in" → desire in Marcus's DB. "Marcus's relationship with Morgan deepened" → relationship row in Marcus's DB with subject="morgan" or subject="user".
+- Cross-character relationships: each side gets their own row in their own DB. Morgan's view of Marcus → relationship in main with subject="marcus". Marcus's view of Morgan → relationship in Marcus's DB with subject="morgan" or subject="user". Both can exist; they're independent.
+- `register_npc` always operates on main (it creates the NPC). `needs_delta` always operates on main (NPCs don't have needs files by design).
+- Most turns where an NPC is on stage should produce AT LEAST ONE op for that NPC, in addition to the main-character ops. NPCs that "haven't been touched in many turns" are a sign you're forgetting to write their side.
+
+DO NOT add `"npc"` for ops that are about the protagonist's view of the NPC. Those go to main with subject set to the NPC's name. The npc field is for ops that represent the NPC's OWN internal state.
 """
 
 
@@ -2736,25 +2757,74 @@ def _op_needs_delta(conn, op, current_turn, char_key):
         apply_needs_delta(char_key, delta)
 
 
+# Ops that always run against the main character's DB regardless of any
+# `npc` field on them. register_npc creates the NPC (must run on main),
+# and needs_delta updates needs.json which only exists on main.
+_MAIN_ONLY_OPS = {"register_npc", "needs_delta"}
+
+
+def _resolve_npc_target(char_key: str, op_npc) -> tuple[Optional[str], Optional[str]]:
+    """Resolve an op's `npc` field to an existing npc_key. Sonnet usually
+    emits the display name ("Marcus") but can sometimes emit the slug
+    ("marcus_a3f9") — _find_matching_npc handles both via token overlap.
+
+    Returns (npc_key, error). npc_key is None when no NPC matches; error
+    is a human-readable string explaining what went wrong, or None on
+    a clean None resolution.
+    """
+    if not op_npc:
+        return None, None
+    matched = _find_matching_npc(char_key, str(op_npc))
+    if matched and matched.get("npc_key"):
+        return matched["npc_key"], None
+    return None, f"unknown npc {op_npc!r} — register_npc first or check the name"
+
+
 def _apply_ops(conn, ops: list[dict], current_turn: int, char_key: str) -> tuple[int, list[str]]:
-    """Apply a batch of ops atomically. Returns (applied_count, errors)."""
+    """Apply a batch of ops, routing each to the appropriate DB.
+
+    Each op may carry an `npc` field naming an NPC by display name, alias,
+    or slug. When present, the op runs against that NPC's DB instead of
+    the main character's. Without it, the op runs against main.
+
+    Per-op transaction (vs. one batch transaction): NPC ops live in
+    different SQLite connections than main, so wrapping the whole batch
+    in a single transaction wouldn't actually be atomic across DBs. Each
+    op is small and self-contained; per-op tx still gives us safety
+    against partial state inside any single op while letting us route
+    different ops to different connections.
+    """
     applied = 0
     errors: list[str] = []
-    with transaction(conn):
-        for op in ops:
-            if not isinstance(op, dict):
-                errors.append(f"non-dict op: {op!r}")
+    for op in ops:
+        if not isinstance(op, dict):
+            errors.append(f"non-dict op: {op!r}")
+            continue
+        kind = op.get("op")
+        handler = _OP_HANDLERS.get(kind)
+        if not handler:
+            errors.append(f"unknown op: {kind!r}")
+            continue
+
+        # Resolve the target connection: main, or a specific NPC.
+        target_conn = conn
+        op_npc = op.get("npc") if kind not in _MAIN_ONLY_OPS else None
+        if op_npc:
+            npc_key, npc_err = _resolve_npc_target(char_key, op_npc)
+            if npc_err:
+                errors.append(f"{kind}: {npc_err}")
                 continue
-            kind = op.get("op")
-            handler = _OP_HANDLERS.get(kind)
-            if not handler:
-                errors.append(f"unknown op: {kind!r}")
+            target_conn = get_connection(char_key, npc_key=npc_key)
+            if target_conn is None:
+                errors.append(f"{kind}: failed to open NPC DB for {npc_key!r}")
                 continue
-            try:
-                handler(conn, op, current_turn, char_key)
-                applied += 1
-            except Exception as e:
-                errors.append(f"{kind} failed: {e} — op={op!r}")
+
+        try:
+            with transaction(target_conn):
+                handler(target_conn, op, current_turn, char_key)
+            applied += 1
+        except Exception as e:
+            errors.append(f"{kind} failed: {e} — op={op!r}")
     return applied, errors
 
 
