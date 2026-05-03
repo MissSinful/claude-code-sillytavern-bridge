@@ -2763,29 +2763,72 @@ def _op_needs_delta(conn, op, current_turn, char_key):
 _MAIN_ONLY_OPS = {"register_npc", "needs_delta"}
 
 
+def _protagonist_names_for(char_key: str) -> set[str]:
+    """Return the lowercased name(s) the protagonist might be referred to by.
+
+    Sourced from the user-set label (the only reliable signal we have for
+    "who is this character"). Includes the full label and the first token
+    so both "Yumi Tanaka" and "Yumi" resolve as the protagonist.
+
+    Empty set when no label is set — in that case the bridge can't tell
+    a protagonist-name collision from a real NPC reference and falls
+    through to the auto-register path.
+    """
+    label = load_label(char_key)
+    if not label:
+        return set()
+    out = {label.lower().strip()}
+    parts = label.split()
+    if parts:
+        out.add(parts[0].lower().strip())
+    return out
+
+
 def _resolve_or_autoregister_npc(
     char_key: str, main_conn, op_npc, current_turn: int
 ) -> tuple[Optional[str], Optional[str]]:
-    """Resolve an op's `npc` field to an existing NPC, auto-registering a
-    stub if no match exists. Returns (npc_key, error_or_None).
+    """Resolve an op's `npc` field to a target. Returns (npc_key, error):
 
-    Sonnet's maintenance prompt asks for an explicit register_npc op
-    before emitting NPC-scoped ops, but in practice it often skips the
-    register step and just uses the `npc` field directly. Dropping those
-    ops loses real signal — Sonnet only attaches `npc` when it considers
-    the entity worth tracking. Auto-registering a stub is the more
-    forgiving call: it reserves the slot, drops a pointer row in main so
-    the GUI lists the NPC, and lets the op proceed. The stub starts with
-    no bio, which subsequent maintenance passes can fill in via update
-    ops (or a future register_npc with a bio will populate it).
+      (npc_key, None)   → route the op to that NPC's DB
+      (None, None)      → route to MAIN (op_npc empty OR matches protagonist)
+      (None, "<error>") → drop the op (auto-register failed)
+
+    Routing logic:
+      1. If op_npc matches the protagonist's name (per the user's label),
+         strip the field and route to main. Sonnet sometimes confuses who
+         the protagonist is and tries to send the protagonist's own POV
+         ops to a phantom NPC of the same name. Without this guard, those
+         ops would either drop or auto-create a duplicate-of-protagonist
+         NPC. Loud WARN log so it's traceable.
+      2. Otherwise try _find_matching_npc — fuzzy match against existing
+         NPCs by name, alias, or slug.
+      3. If still no match, auto-register a stub. Sonnet's maintenance
+         prompt asks for an explicit register_npc op first, but in
+         practice it often skips that and just uses the `npc` field
+         directly. Auto-register reserves the slot, drops a pointer row
+         in main so the GUI lists the NPC, and lets the op proceed. Bio
+         starts empty and gets filled in by future maintenance passes.
     """
     if not op_npc:
         return None, None
+
+    # 1. Protagonist-name guard.
+    proto_names = _protagonist_names_for(char_key)
+    if proto_names and str(op_npc).lower().strip() in proto_names:
+        log(
+            f"_apply_ops: stripping npc={op_npc!r} — matches protagonist label "
+            f"({sorted(proto_names)}). Routing op to MAIN DB instead. "
+            f"Sonnet appears to be misclassifying the protagonist as an NPC.",
+            "WARN",
+        )
+        return None, None
+
+    # 2. Fuzzy match against existing NPCs.
     matched = _find_matching_npc(char_key, str(op_npc))
     if matched and matched.get("npc_key"):
         return matched["npc_key"], None
 
-    # No match → auto-register a stub.
+    # 3. Auto-register a stub.
     npc_key = register_npc(
         char_key=char_key,
         name=str(op_npc),
@@ -2796,9 +2839,8 @@ def _resolve_or_autoregister_npc(
     if not npc_key:
         return None, f"auto-register failed for {op_npc!r}"
 
-    # Drop a pointer fact row in main so list_npcs / retrieval / GUI find
-    # the new NPC immediately. Mirrors what _op_register_npc does for
-    # explicit registrations.
+    # Pointer fact row in main so list_npcs / retrieval / GUI find the new
+    # NPC immediately. Mirrors what _op_register_npc does for explicit ones.
     if main_conn is not None:
         try:
             insert_memory(
@@ -2856,23 +2898,28 @@ def _apply_ops(conn, ops: list[dict], current_turn: int, char_key: str) -> tuple
             errors.append(f"unknown op: {kind!r}")
             continue
 
-        # Resolve the target connection: main, or a specific NPC. If the
-        # op references an unknown NPC, auto-register a stub so the op
-        # doesn't get dropped on the floor (Sonnet often skips an explicit
-        # register_npc op and just uses the `npc` field directly).
+        # Resolve the target connection. _resolve_or_autoregister_npc
+        # returns (npc_key, error) in three shapes:
+        #   (npc_key, None)   → route to that NPC's DB
+        #   (None, None)      → route to MAIN (op_npc empty OR matches
+        #                       protagonist's name, in which case the
+        #                       resolver already logged a WARN)
+        #   (None, "<error>") → drop the op
         target_conn = conn
         op_npc = op.get("npc") if kind not in _MAIN_ONLY_OPS else None
         if op_npc:
             npc_key, npc_err = _resolve_or_autoregister_npc(
                 char_key, conn, op_npc, current_turn
             )
-            if npc_err or not npc_key:
-                errors.append(f"{kind}: {npc_err or 'NPC route failed'}")
+            if npc_err:
+                errors.append(f"{kind}: {npc_err}")
                 continue
-            target_conn = get_connection(char_key, npc_key=npc_key)
-            if target_conn is None:
-                errors.append(f"{kind}: failed to open NPC DB for {npc_key!r}")
-                continue
+            if npc_key:
+                target_conn = get_connection(char_key, npc_key=npc_key)
+                if target_conn is None:
+                    errors.append(f"{kind}: failed to open NPC DB for {npc_key!r}")
+                    continue
+            # else: protagonist match — target_conn stays at main
 
         try:
             with transaction(target_conn):
