@@ -2763,21 +2763,71 @@ def _op_needs_delta(conn, op, current_turn, char_key):
 _MAIN_ONLY_OPS = {"register_npc", "needs_delta"}
 
 
-def _resolve_npc_target(char_key: str, op_npc) -> tuple[Optional[str], Optional[str]]:
-    """Resolve an op's `npc` field to an existing npc_key. Sonnet usually
-    emits the display name ("Marcus") but can sometimes emit the slug
-    ("marcus_a3f9") — _find_matching_npc handles both via token overlap.
+def _resolve_or_autoregister_npc(
+    char_key: str, main_conn, op_npc, current_turn: int
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve an op's `npc` field to an existing NPC, auto-registering a
+    stub if no match exists. Returns (npc_key, error_or_None).
 
-    Returns (npc_key, error). npc_key is None when no NPC matches; error
-    is a human-readable string explaining what went wrong, or None on
-    a clean None resolution.
+    Sonnet's maintenance prompt asks for an explicit register_npc op
+    before emitting NPC-scoped ops, but in practice it often skips the
+    register step and just uses the `npc` field directly. Dropping those
+    ops loses real signal — Sonnet only attaches `npc` when it considers
+    the entity worth tracking. Auto-registering a stub is the more
+    forgiving call: it reserves the slot, drops a pointer row in main so
+    the GUI lists the NPC, and lets the op proceed. The stub starts with
+    no bio, which subsequent maintenance passes can fill in via update
+    ops (or a future register_npc with a bio will populate it).
     """
     if not op_npc:
         return None, None
     matched = _find_matching_npc(char_key, str(op_npc))
     if matched and matched.get("npc_key"):
         return matched["npc_key"], None
-    return None, f"unknown npc {op_npc!r} — register_npc first or check the name"
+
+    # No match → auto-register a stub.
+    npc_key = register_npc(
+        char_key=char_key,
+        name=str(op_npc),
+        bio="",  # filled by future maintenance turns
+        introduced_at_turn=current_turn,
+        status="active",
+    )
+    if not npc_key:
+        return None, f"auto-register failed for {op_npc!r}"
+
+    # Drop a pointer fact row in main so list_npcs / retrieval / GUI find
+    # the new NPC immediately. Mirrors what _op_register_npc does for
+    # explicit registrations.
+    if main_conn is not None:
+        try:
+            insert_memory(
+                main_conn,
+                type="fact",
+                content=f"{op_npc} [{npc_key}] — auto-registered from NPC-scoped op",
+                subject=npc_key,
+                importance=3,
+                created_turn=current_turn,
+                last_seen_turn=current_turn,
+                tags="npc,auto",
+                metadata={
+                    "source": "post_turn",
+                    "kind": "npc_auto_registered",
+                    "name": str(op_npc),
+                    "introduced_at": current_turn,
+                    "npc_key": npc_key,
+                },
+                embedding=embed(str(op_npc)),
+            )
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            log(f"auto-register[{op_npc!r}] pointer insert failed: {e}", "WARN")
+
+    log(
+        f"auto-registered NPC {op_npc!r} → {npc_key!r} (no prior register_npc, "
+        f"recovered from npc-scoped op)",
+        "WARN",
+    )
+    return npc_key, None
 
 
 def _apply_ops(conn, ops: list[dict], current_turn: int, char_key: str) -> tuple[int, list[str]]:
@@ -2806,13 +2856,18 @@ def _apply_ops(conn, ops: list[dict], current_turn: int, char_key: str) -> tuple
             errors.append(f"unknown op: {kind!r}")
             continue
 
-        # Resolve the target connection: main, or a specific NPC.
+        # Resolve the target connection: main, or a specific NPC. If the
+        # op references an unknown NPC, auto-register a stub so the op
+        # doesn't get dropped on the floor (Sonnet often skips an explicit
+        # register_npc op and just uses the `npc` field directly).
         target_conn = conn
         op_npc = op.get("npc") if kind not in _MAIN_ONLY_OPS else None
         if op_npc:
-            npc_key, npc_err = _resolve_npc_target(char_key, op_npc)
-            if npc_err:
-                errors.append(f"{kind}: {npc_err}")
+            npc_key, npc_err = _resolve_or_autoregister_npc(
+                char_key, conn, op_npc, current_turn
+            )
+            if npc_err or not npc_key:
+                errors.append(f"{kind}: {npc_err or 'NPC route failed'}")
                 continue
             target_conn = get_connection(char_key, npc_key=npc_key)
             if target_conn is None:
