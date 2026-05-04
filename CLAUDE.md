@@ -14,3 +14,11 @@ When asked to describe an image in this project, you are acting as a visual-to-t
 - **Bridge**: `claude_bridge.py` - translates between SillyTavern's OpenAI-compatible API format and Claude Code CLI
 - **Purpose**: Collaborative fiction, interactive storytelling, character roleplay
 - **Image handling**: Images are saved to `temp_images/`, described by a subprocess, and the text description is injected into the conversation for the main writing AI
+
+## Branching
+
+- **`main`** is the published/released branch. Every commit here corresponds to a tagged release that's been (or is about to be) posted to GitHub Releases. Don't push directly to main.
+- **`dev`** is the integration branch. All work-in-progress lives here. Daily commits, feature work, bug fixes — all go to dev.
+- **Releasing:** when a batch of dev work is ready to publish, merge `dev` → `main`, tag the merge commit `vX.Y.Z`, push both, then post the GitHub Release pointing at the tag.
+
+Default to `dev` for any commit unless the user is explicitly cutting a release.
