@@ -1582,6 +1582,8 @@ RULES:
 - Output ONLY the JSON object. No commentary.
 - Skip arrays/keys you have no content for. Empty arrays are fine.
 - Don't invent traits not implied by the bio. Better to return mostly-empty than to hallucinate.
+- DO NOT duplicate content across categories. One observation belongs in ONE category. "Cheerful but not intrusive" is a `trait`, not also a `fact`. "Wears oversized crewnecks" is a `body` row, not also a `fact`. "Lives on the third floor" is a `fact`, not a trait. If you can't decide between two categories, pick the more specific one and skip the other.
+- Each entry should be a SINGLE atomic observation, not a paragraph. "Cheerful but not intrusive" — yes. "Cheerful but not intrusive; wears oversized crewnecks; lives on third floor" — no, split into three rows in the right categories.
 """
 
 
@@ -1652,19 +1654,24 @@ def _npc_seed_from_bio(char_key: str, npc_key: str, name: str, bio: str, current
                         embedding=embed(content),
                     )
                     seeded += 1
-            # Always include the raw bio as one anchor `fact`. Lets the NPC
-            # appear in semantic search even if Sonnet returned nothing.
-            insert_memory(
-                conn,
-                type="fact",
-                content=f"{name}: {bio.strip()[:500]}",
-                importance=3,
-                created_turn=current_turn,
-                tags="npc_bio",
-                metadata={"source": "npc_bio"},
-                embedding=embed(f"{name}: {bio[:500]}"),
-            )
-            seeded += 1
+            # Fallback only: if granular extraction produced nothing, drop
+            # the raw bio in as one anchor `fact` so the NPC at least
+            # appears in semantic search. When Sonnet DID extract granular
+            # rows, the catchall is just duplicated content (the bio gets
+            # split into individual rows AND copied wholesale, doubling
+            # everything in the GUI).
+            if seeded == 0:
+                insert_memory(
+                    conn,
+                    type="fact",
+                    content=f"{name}: {bio.strip()[:500]}",
+                    importance=3,
+                    created_turn=current_turn,
+                    tags="npc_bio",
+                    metadata={"source": "npc_bio"},
+                    embedding=embed(f"{name}: {bio[:500]}"),
+                )
+                seeded += 1
     except Exception as e:
         log(f"npc_seed_from_bio failed for {npc_key}: {e}", "WARN")
 
