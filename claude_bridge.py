@@ -754,14 +754,14 @@ def summarize_new_messages(new_messages):
         return ""
 
     prompt = load_prompt("summarize_incremental", msg_text=msg_text)
-    result = call_claude_code([{"role": "user", "content": prompt}])
+    result = call_claude_code([{"role": "user", "content": prompt}], skip_memory=True)
     return result.get("response", "").strip()
 
 
 def condense_summary(long_summary):
     """Condense a summary that's gotten too long."""
     prompt = load_prompt("condense", long_summary=long_summary)
-    result = call_claude_code([{"role": "user", "content": prompt}])
+    result = call_claude_code([{"role": "user", "content": prompt}], skip_memory=True)
     return result.get("response", "").strip()
 
 
@@ -2469,7 +2469,7 @@ def _update_session(char_key: str, session_id: str, messages: list):
 _load_sessions()
 
 
-def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None) -> dict:
+def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None, skip_memory: bool = False) -> dict:
     """
     Call Claude Code CLI with the given messages.
     Converts OpenAI message format to a prompt for Claude.
@@ -2742,7 +2742,15 @@ Use the Read tool to view each, then weave the visual details into your scene wi
     # no extra tools or permission-mode flags are required.
     memory_v2_active = False
     memory_v2_char_key = None
-    if runtime_settings.get("character_memory_v2_enabled", False):
+    # skip_memory short-circuits the memory v2 pipeline. Set by utility
+    # callers (chunking summary, condense, lorebook generation, etc.)
+    # where we're using call_claude_code as a generic Sonnet/Opus wrapper
+    # and not for an actual roleplay turn. Without this guard, every
+    # utility call ran prepare_turn, fired Sonnet ranking + semantic
+    # search on the utility prompt, injected character memory into the
+    # summarization context, and then staged the utility response as if
+    # it were the character's narrative — contaminating the memory DB.
+    if not skip_memory and runtime_settings.get("character_memory_v2_enabled", False):
         # Pinned key takes precedence over message-fingerprint derivation.
         # When the user has pinned a char_key from the Memory tab, we use
         # that exact value for both memory ops AND CLI session reuse — so
@@ -3596,7 +3604,7 @@ The above summarizes the story so far. Continue from the recent messages below."
                             chunk_text=chunk_text,
                         )
 
-                        result = call_claude_code([{"role": "user", "content": prompt}])
+                        result = call_claude_code([{"role": "user", "content": prompt}], skip_memory=True)
                         chunk_results.append(result.get("response", ""))
                         log(f"Chunk {i} done: {len(chunk_results[-1])} chars")
 
@@ -3638,7 +3646,7 @@ Now, based on this context, please respond to the following request:
 {last_user_msg}"""
 
                 log("Sending final request with context...")
-                final_result = call_claude_code([{"role": "user", "content": final_prompt}])
+                final_result = call_claude_code([{"role": "user", "content": final_prompt}], skip_memory=True)
                 response_text = final_result.get("response", "")
 
                 # Consolidate multiple think blocks into one (ST only supports one)
@@ -4799,7 +4807,7 @@ CONVERSATION:
     full_prompt = summary_prompt + conv_text
     log(f"    Chunk {chunk_num} prompt: {len(full_prompt)} chars")
 
-    result = call_claude_code([{"role": "user", "content": full_prompt}])
+    result = call_claude_code([{"role": "user", "content": full_prompt}], skip_memory=True)
     response = result.get("response", "")
 
     if not response:
@@ -4841,7 +4849,7 @@ CONVERSATION:
 
     full_prompt = character_prompt + conv_text
 
-    result = call_claude_code([{"role": "user", "content": full_prompt}])
+    result = call_claude_code([{"role": "user", "content": full_prompt}], skip_memory=True)
     return result.get("response", "")
 
 
@@ -4934,7 +4942,7 @@ PARTIAL ANALYSES:
 """ + "\n\n---\n\n".join(f"[Part {i+1}]\n{r}" for i, r in enumerate(chunk_results))
 
         # Final combination call
-        final_result = call_claude_code([{"role": "user", "content": combine_prompt}])
+        final_result = call_claude_code([{"role": "user", "content": combine_prompt}], skip_memory=True)
 
         log("  Done!")
         log("=" * 50)
