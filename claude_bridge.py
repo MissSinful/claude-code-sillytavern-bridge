@@ -2435,6 +2435,37 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     if (last_stored_user_sig is not None
             and last_new_user_sig is not None
             and last_new_user_sig == last_stored_user_sig):
+        # Diagnostic: surface what the last user sig looks like in both
+        # the stored snapshot and the new request, plus where the new last
+        # user msg sits in the message list. False positives here usually
+        # mean either ST is appending something after the user's actual
+        # reply (so "find last user" returns an earlier msg) or signature
+        # truncation (200 chars) is making two distinct messages collide.
+        try:
+            new_user_pos = -1
+            for idx in range(len(messages) - 1, -1, -1):
+                if messages[idx].get("role") == "user":
+                    new_user_pos = idx
+                    break
+            new_total = len(messages)
+            log(
+                f"swipe diagnostic: last_user matched stored. "
+                f"new last-user is at position {new_user_pos} of {new_total} "
+                f"(distance from end: {new_total - 1 - new_user_pos if new_user_pos >= 0 else '?'})",
+                "INFO",
+            )
+            log(f"  stored last-user sig: {last_stored_user_sig[:200]!r}", "INFO")
+            log(f"  new    last-user sig: {last_new_user_sig[:200]!r}", "INFO")
+            # Show the next few stored sigs after the last-user too — if
+            # there were assistant msgs after the captured user msg (the
+            # response we cached), they'd be there.
+            stored_tail = stored_per_msg[-5:]
+            log(f"  stored tail (last 5 sigs): {[s[:60] for s in stored_tail]}", "INFO")
+            # And the same for the new tail.
+            new_tail = new_full_sigs[-5:]
+            log(f"  new    tail (last 5 sigs): {[s[:60] for s in new_tail]}", "INFO")
+        except Exception as e:
+            log(f"swipe diagnostic failed: {e}", "WARN")
         with _SESSION_LOCK:
             SESSION_MAP.pop(char_key, None)
             _save_sessions()
