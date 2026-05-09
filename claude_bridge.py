@@ -2324,10 +2324,11 @@ def _msg_text(m: dict) -> str:
 def _per_msg_prefix_sigs(messages: list, prefix_count: int) -> list:
     """Build the per-message signatures used by both the prefix hash and the
     diagnostic. Returns a list of `<role-initial>:<first-200-chars>` strings,
-    one per user/assistant message up to prefix_count. System messages are
-    skipped because ST churns them every turn (lorebook entries, persona
-    notes etc.) and that churn is benign — only user/assistant content edits
-    should invalidate the session."""
+    one per user/assistant message up to prefix_count. Pass a very large
+    prefix_count (e.g. 10**9) to get all user/asst sigs in the messages list.
+    System messages are skipped because ST churns them every turn (lorebook
+    entries, persona notes etc.) and that churn is benign — only
+    user/assistant content edits should invalidate the session."""
     sigs = []
     count = 0
     for m in messages:
@@ -2338,6 +2339,35 @@ def _per_msg_prefix_sigs(messages: list, prefix_count: int) -> list:
         sigs.append(f"{m['role'][0]}:{_msg_text(m)[:200]}")
         count += 1
     return sigs
+
+
+def _stored_content_intact_in(haystack: list, needle: list) -> tuple[bool, int]:
+    """Return (intact, new_msg_count) where intact is True if every signature
+    in `needle` appears in `haystack` at least as many times as it appears
+    in `needle`. new_msg_count is the count of haystack signatures that
+    aren't in needle (i.e. messages added since the session was captured).
+
+    Multiset (rather than contiguous-subsequence) comparison handles the
+    real failure mode: ST inserting a new intro card / persona note in the
+    middle of history. That breaks contiguity (an insertion mid-sequence
+    isn't a contiguous slice anymore) but the stored content is all still
+    present. Multiset confirms presence regardless of position.
+
+    The trade-off: a literal cut-and-paste reorder (move msg X from
+    position 5 to position 12) would still register as intact since the
+    multiset is unchanged. ST doesn't reorder messages in practice; this
+    is acceptable.
+    """
+    if not needle:
+        return True, len(haystack)
+    from collections import Counter
+    needle_counts = Counter(needle)
+    haystack_counts = Counter(haystack)
+    for sig, count in needle_counts.items():
+        if haystack_counts.get(sig, 0) < count:
+            return False, 0
+    new_msgs = sum(haystack_counts.values()) - sum(needle_counts.values())
+    return True, new_msgs
 
 
 def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
@@ -2396,21 +2426,14 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
 
     new_count = len(messages)
     delta = new_count - last_count
-    # Why: ST appends user (+1) or user+assistant (+2) between turns.
-    # Anything else means swipe (same count, content replaced), edit, or
-    # a rebuilt context — cache no longer valid.
-    if delta not in (1, 2):
-        with _SESSION_LOCK:
-            SESSION_MAP.pop(char_key, None)
-            _save_sessions()
-        return (char_key, None, f"message delta {delta} invalidates session")
 
-    # Disambiguate swipe vs accept inside delta==1/2. ST sends the swiped
-    # assistant response back as part of history when the user clicks swipe,
-    # so total delta=+1 with NO new user message is the swipe shape — and
-    # resuming there causes the CLI to act like a "continue" button instead
-    # of regenerating the turn. Compare the user-message count: if it didn't
-    # advance, this is a swipe regardless of total delta.
+    # Primary signal: user-message count delta. Real follow-ups always add
+    # at least one user message; swipes / rewinds / no-change replays don't.
+    # The OLD heuristic `delta in (1, 2)` was too strict — it invalidated
+    # legitimately on auto-summary's fixed-shape rebuild (delta=0) and on
+    # turns where ST inserted an intro card or persona note (delta>2).
+    # user_delta is the more reliable signal and the prefix-subseq check
+    # below catches actual content edits.
     if last_user_count is not None:
         new_user_count = _count_user_msgs(messages)
         user_delta = new_user_count - last_user_count
@@ -2418,54 +2441,79 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
             with _SESSION_LOCK:
                 SESSION_MAP.pop(char_key, None)
                 _save_sessions()
-            return (char_key, None, f"swipe detected (user_delta={user_delta}, total_delta={delta})")
+            return (char_key, None, f"swipe/rewind detected (user_delta={user_delta}, total_delta={delta})")
+    elif delta not in (1, 2):
+        # Backwards compat: legacy entries without last_user_count fall
+        # back to the old delta heuristic for one turn (until the entry
+        # gets re-stamped on the next response).
+        with _SESSION_LOCK:
+            SESSION_MAP.pop(char_key, None)
+            _save_sessions()
+        return (char_key, None, f"message delta {delta} invalidates session (legacy entry)")
 
     # Detect prefix edits: if the user changed an earlier message's content
     # (without changing message counts), the CLI session's cached prefix is
     # stale and must be invalidated — otherwise the model never sees the
     # edit because --resume only sends the latest user message.
     #
-    # We hash the user+assistant content of the previous prefix on session
-    # capture, then on the next request hash the SAME prefix length from
-    # the new messages. If the hashes differ, something in the prefix was
-    # edited → invalidate. System messages are excluded from the hash so
-    # ST's lorebook entries (which churn every turn as keywords shift)
-    # don't trigger spurious invalidation.
+    # Two-stage check:
+    #   1. Hash the first `last_user_asst_count` user+asst messages. If the
+    #      hash matches stored, fast-path resume.
+    #   2. If hashes differ, the prefix MAY have been edited OR it may have
+    #      just been shifted by an insertion (ST sometimes inserts intro
+    #      cards / persona notes / state messages mid-history that weren't
+    #      there the prior turn). Check if the stored sigs still appear as
+    #      a contiguous subsequence of the new full user/asst list. If yes
+    #      → insertion, content intact, resume OK. If no → real edit,
+    #      invalidate.
+    #
+    # System messages are excluded from sigs throughout — ST's lorebook
+    # entries churn every turn and shouldn't drive invalidation.
     if last_user_asst_count and last_prefix_hash:
         new_prefix_hash = _hash_user_asst_prefix(messages, last_user_asst_count)
         if new_prefix_hash and new_prefix_hash != last_prefix_hash:
-            # Diagnostic: which message(s) actually differ? Log per-message
-            # signatures so we can see whether this is a real edit or some
-            # benign churn (macro expansion, persona note re-render, etc.)
-            # that should be tolerated rather than invalidated.
-            try:
-                stored_per_msg = entry.get("last_prefix_per_msg") or []
-                new_per_msg = _per_msg_prefix_sigs(messages, last_user_asst_count)
-                diffs = []
-                for i in range(min(len(stored_per_msg), len(new_per_msg))):
-                    if stored_per_msg[i] != new_per_msg[i]:
-                        diffs.append(i)
-                if diffs:
+            stored_per_msg = entry.get("last_prefix_per_msg") or []
+            # Build the full new sig list (not truncated) so we can search
+            # for the stored sequence anywhere in it.
+            new_full_sigs = _per_msg_prefix_sigs(messages, prefix_count=10**9)
+
+            intact, new_msg_count = _stored_content_intact_in(new_full_sigs, stored_per_msg)
+            if intact:
+                log(
+                    f"prefix hash differs but content intact: every stored sig is "
+                    f"present in the new {len(new_full_sigs)}-msg sequence "
+                    f"(+{new_msg_count} new). Likely an inserted intro/persona/lorebook "
+                    f"msg in the middle, not an edit. Allowing resume.",
+                    "INFO",
+                )
+                # Fall through — don't invalidate. Hash will be re-stamped
+                # on the next _update_session call after this turn succeeds.
+            else:
+                # Real edit: stored sequence doesn't appear in new — content
+                # was changed, not just inserted around. Diagnostic + bail.
+                try:
+                    diffs = []
+                    for i in range(min(len(stored_per_msg), last_user_asst_count, len(new_full_sigs))):
+                        if i >= len(stored_per_msg) or i >= len(new_full_sigs):
+                            break
+                        if stored_per_msg[i] != new_full_sigs[i]:
+                            diffs.append(i)
                     log(
                         f"prefix-edit diagnostic: {len(diffs)} of {last_user_asst_count} "
-                        f"msgs differ (positions {diffs[:5]}{'...' if len(diffs)>5 else ''})",
+                        f"msgs differ (positions {diffs[:5]}{'...' if len(diffs)>5 else ''}); "
+                        f"stored sequence does NOT appear in new — real edit",
                         "INFO",
                     )
                     for i in diffs[:3]:
-                        log(f"  msg[{i}] stored: {stored_per_msg[i][:120]!r}", "INFO")
-                        log(f"  msg[{i}] now:    {new_per_msg[i][:120]!r}", "INFO")
-                else:
-                    log(
-                        "prefix-edit diagnostic: hashes differ but per-msg sigs identical "
-                        "(maybe length-mismatch or stored sigs absent)",
-                        "INFO",
-                    )
-            except Exception as e:
-                log(f"prefix-edit diagnostic failed: {e}", "WARN")
-            with _SESSION_LOCK:
-                SESSION_MAP.pop(char_key, None)
-                _save_sessions()
-            return (char_key, None, "prefix edit detected (content hash changed)")
+                        if i < len(stored_per_msg) and i < len(new_full_sigs):
+                            log(f"  msg[{i}] stored: {stored_per_msg[i][:120]!r}", "INFO")
+                            log(f"  msg[{i}] now:    {new_full_sigs[i][:120]!r}", "INFO")
+                except Exception as e:
+                    log(f"prefix-edit diagnostic failed: {e}", "WARN")
+                with _SESSION_LOCK:
+                    SESSION_MAP.pop(char_key, None)
+                    _save_sessions()
+                return (char_key, None, "prefix edit detected (content hash changed)")
 
     # Historically we also hashed system messages to invalidate when the
     # system prompt / preset / character card changed. That hash fired
