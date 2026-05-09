@@ -761,7 +761,7 @@
         <nav class="tabs">
             <button class="tab active" data-num="I" onclick="showTab('welcome')">Welcome</button>
             <button class="tab" data-num="II" onclick="showTab('settings')">Settings</button>
-            <button class="tab" data-num="III" onclick="showTab('system')">System Prompt</button>
+            <button class="tab" data-num="III" onclick="showTab('system')">Prompts (System / Thinking)</button>
             <button class="tab" data-num="IV" onclick="showTab('tools')">Tools</button>
             <button class="tab" data-num="V" onclick="showTab('lorebook')">Lorebook</button>
             <button class="tab" data-num="VI" onclick="showTab('memory')">Memory</button>
@@ -1037,12 +1037,11 @@
             <span id="saveStatus" style="margin-left:15px;color:var(--success);display:none;">Settings saved!</span>
         </div>
 
-        <!-- System Prompt Panel -->
+        <!-- Prompts Panel: System Prompt + Thinking Prompts -->
         <div id="system" class="panel">
-            <h3>Bridge System Prompt</h3>
+            <h3>Bridge Prompts</h3>
             <p>
-                The system prompt injected by the bridge to override Claude Code's default coding assistant behavior.
-                Edit to customize how Claude behaves during roleplay. Leave empty for the default.
+                Three prompts the bridge controls: the <strong>system prompt</strong> (Claude's role / framing for the whole RP) and the two <strong>thinking prompts</strong> (planning + response-format guidance, swapped automatically based on the "Include Thinking" toggle in Settings). All three are editable; leave any empty to fall back to the bundled default.
             </p>
 
             <div class="setting-card" style="max-width:100%;">
@@ -1061,12 +1060,43 @@
             </div>
 
             <div class="setting-card" style="max-width:100%;margin-top:20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h3 style="margin:0;">Thinking Prompt (used when "Include Thinking" is ON)</h3>
+                    <button class="btn" onclick="resetThinkingPrompt()" style="padding:5px 10px;font-size:12px;">Reset to Default</button>
+                </div>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    Appended at the end of every request when thinking is enabled. Tells the model how to use <code>&lt;think&gt;...&lt;/think&gt;</code> and reminds it that narrative output is mandatory after the closing tag. Customize if you want a different planning style or your own structured CoT — leave empty to use the bundled default.
+                </p>
+                <textarea id="thinkingPromptEditor" style="width:100%;height:280px;background:var(--ink-sunk);color:var(--paper);border:1px solid var(--rule);padding:20px;font-family:var(--font-mono);font-size:12.5px;line-height:1.7;resize:vertical;"></textarea>
+                <div style="margin-top:15px;display:flex;gap:10px;align-items:center;">
+                    <button class="btn" onclick="saveThinkingPrompt()">Save</button>
+                    <span id="thinkingPromptStatus" style="color:var(--success);display:none;">Saved!</span>
+                </div>
+            </div>
+
+            <div class="setting-card" style="max-width:100%;margin-top:20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h3 style="margin:0;">No-Thinking Prompt (used when "Include Thinking" is OFF)</h3>
+                    <button class="btn" onclick="resetNoThinkingPrompt()" style="padding:5px 10px;font-size:12px;">Reset to Default</button>
+                </div>
+                <p style="color:var(--paper-faint);font-size:12px;margin-bottom:15px;">
+                    Appended when thinking is disabled. Tells the model to skip <code>&lt;think&gt;</code> tags entirely and respond directly. Customize if you want a different framing for direct-response mode — leave empty to use the bundled default.
+                </p>
+                <textarea id="noThinkingPromptEditor" style="width:100%;height:200px;background:var(--ink-sunk);color:var(--paper);border:1px solid var(--rule);padding:20px;font-family:var(--font-mono);font-size:12.5px;line-height:1.7;resize:vertical;"></textarea>
+                <div style="margin-top:15px;display:flex;gap:10px;align-items:center;">
+                    <button class="btn" onclick="saveNoThinkingPrompt()">Save</button>
+                    <span id="noThinkingPromptStatus" style="color:var(--success);display:none;">Saved!</span>
+                </div>
+            </div>
+
+            <div class="setting-card" style="max-width:100%;margin-top:20px;">
                 <h3>How This Works</h3>
                 <ul style="color:var(--paper-dim);font-size:13px;line-height:1.8;">
-                    <li><strong>Bridge System Prompt (above)</strong>: Tells Claude "you are a roleplay writer, not a coding assistant"</li>
+                    <li><strong>Bridge System Prompt</strong>: Tells Claude "you are a roleplay writer, not a coding assistant"</li>
+                    <li><strong>Thinking / No-Thinking Prompt</strong>: Appended at the end of each request, switching based on the "Include Thinking" toggle. Controls how (or whether) the model uses <code>&lt;think&gt;</code> tags before writing the response. Defaults are tuned to keep planning loose and prevent thinking-only responses.</li>
                     <li><strong>SillyTavern System Prompt</strong>: Your character card, scenario, etc. (sent separately)</li>
-                    <li>Both work together - the bridge prompt sets the "mode", SillyTavern provides the content</li>
-                    <li>If you leave the above empty, a sensible default is used</li>
+                    <li>All three work together. Bridge prompt sets the mode, ST provides scene content, thinking prompt controls planning format.</li>
+                    <li>Empty fields fall back to the bundled defaults — never breaks if you misconfigure something.</li>
                 </ul>
             </div>
         </div>
@@ -2454,9 +2484,11 @@
             }
         }
 
-        // Default system prompt is fetched from the backend on load so the GUI
-        // can never drift from the real default baked into claude_bridge.py.
+        // Default prompts are fetched from the backend on load so the GUI
+        // can never drift from the real defaults baked into claude_bridge.py.
         let DEFAULT_SYSTEM_PROMPT = '';
+        let DEFAULT_THINKING_PROMPT = '';
+        let DEFAULT_NO_THINKING_PROMPT = '';
         async function loadDefaultSystemPrompt() {
             try {
                 const response = await fetch('/api/settings/default_system_prompt');
@@ -2464,6 +2496,18 @@
                 DEFAULT_SYSTEM_PROMPT = data.default_system_prompt || '';
             } catch (e) {
                 console.error('Failed to load default system prompt:', e);
+            }
+        }
+        async function loadDefaultThinkingPrompts() {
+            try {
+                const r1 = await fetch('/api/settings/default_thinking_prompt');
+                const d1 = await r1.json();
+                DEFAULT_THINKING_PROMPT = d1.default_thinking_prompt || '';
+                const r2 = await fetch('/api/settings/default_no_thinking_prompt');
+                const d2 = await r2.json();
+                DEFAULT_NO_THINKING_PROMPT = d2.default_no_thinking_prompt || '';
+            } catch (e) {
+                console.error('Failed to load default thinking prompts:', e);
             }
         }
 
@@ -2636,6 +2680,13 @@
 
                 // System prompt override - show default if empty
                 document.getElementById('systemPromptEditor').value = settings.system_prompt_override || DEFAULT_SYSTEM_PROMPT;
+
+                // Thinking-prompt editors — show defaults when no override set,
+                // matching the system-prompt pattern.
+                const thinkEditor = document.getElementById('thinkingPromptEditor');
+                if (thinkEditor) thinkEditor.value = settings.thinking_prompt || DEFAULT_THINKING_PROMPT;
+                const noThinkEditor = document.getElementById('noThinkingPromptEditor');
+                if (noThinkEditor) noThinkEditor.value = settings.no_thinking_prompt || DEFAULT_NO_THINKING_PROMPT;
             } catch (e) {
                 console.error('Error loading settings:', e);
             }
@@ -2693,6 +2744,51 @@
             document.getElementById('systemPromptEditor').value = DEFAULT_SYSTEM_PROMPT;
             // Persist the reset so it doesn't evaporate on reload
             await saveSystemPrompt();
+        }
+
+        // Thinking-prompt save/reset (used when "Include Thinking" is ON).
+        // Same pattern as system prompt: POST to /api/settings, surface
+        // status inline, fall back to bundled default on reset.
+        async function _saveTextSetting(settingKey, editorId, statusId) {
+            const value = document.getElementById(editorId).value;
+            const status = document.getElementById(statusId);
+            try {
+                const payload = {};
+                payload[settingKey] = value;
+                const resp = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload),
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                status.textContent = 'Saved!';
+                status.style.color = 'var(--success)';
+                status.style.display = 'inline';
+                setTimeout(() => { status.style.display = 'none'; }, 2000);
+            } catch (e) {
+                console.error(`Error saving ${settingKey}:`, e);
+                status.textContent = 'Save failed: ' + e.message;
+                status.style.color = 'var(--error)';
+                status.style.display = 'inline';
+            }
+        }
+        async function saveThinkingPrompt() {
+            await _saveTextSetting('thinking_prompt', 'thinkingPromptEditor', 'thinkingPromptStatus');
+        }
+        async function saveNoThinkingPrompt() {
+            await _saveTextSetting('no_thinking_prompt', 'noThinkingPromptEditor', 'noThinkingPromptStatus');
+        }
+        async function resetThinkingPrompt() {
+            if (!confirm('Reset thinking prompt to default? This will save immediately.')) return;
+            if (!DEFAULT_THINKING_PROMPT) await loadDefaultThinkingPrompts();
+            document.getElementById('thinkingPromptEditor').value = DEFAULT_THINKING_PROMPT;
+            await saveThinkingPrompt();
+        }
+        async function resetNoThinkingPrompt() {
+            if (!confirm('Reset no-thinking prompt to default? This will save immediately.')) return;
+            if (!DEFAULT_NO_THINKING_PROMPT) await loadDefaultThinkingPrompts();
+            document.getElementById('noThinkingPromptEditor').value = DEFAULT_NO_THINKING_PROMPT;
+            await saveNoThinkingPrompt();
         }
 
         // Update auto-summary status info
@@ -3355,11 +3451,11 @@
             }
         }
 
-        // Initialize — load the default prompt and settings first (the editor
-        // depends on both), then fan out parallel fetches for panels that
+        // Initialize — load the defaults and settings first (the editors
+        // depend on both), then fan out parallel fetches for panels that
         // don't depend on each other.
         (async () => {
-            await loadDefaultSystemPrompt();
+            await Promise.all([loadDefaultSystemPrompt(), loadDefaultThinkingPrompts()]);
             await loadSettings();
             await Promise.all([
                 loadCacheInfo(),
