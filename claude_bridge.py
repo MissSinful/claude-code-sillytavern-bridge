@@ -289,7 +289,8 @@ Use the Read tool to view the image at: {image_path}
 
 Then describe what's depicted, factually, for the writing pass:
 - Image type (photograph, digital art, illustration, screenshot, etc.)
-- Who's in it, positioning, body language, spatial relationships
+- Who's in it, and POSE ARCHITECTURE — this is the most load-bearing part. Don't just say "on her back" or "from behind." Describe what's actually supporting each person's weight, what they're propped on, whether they're sitting up / leaning back / reclining / flat / kneeling / arching, where each hand and arm is and what it's doing (gripping, bracing, hanging, threaded through hair, etc.), where the head is angled, what the legs are doing (wrapped, spread, raised, bent at what angle, feet planted vs lifted). Pose architecture is what the writing pass will get wrong if you skip it.
+- Spatial relationships between people: who is over/under, what body parts are in contact, what's pressing where
 - Clothing state / state of undress / visible body details if relevant to the scene
 - Setting, lighting, mood
 - Visual style
@@ -2676,12 +2677,12 @@ Respond directly with the narrative. Do NOT use <think> tags or write planning n
         )
         prompt += f"""
 
-=== SCENE IMAGES (pre-described — incorporate as context) ===
-The user shared image(s) earlier. Each was viewed by a separate description pass and converted to the text below. Treat these descriptions exactly like anything from the conversation history — they're scene context, not an event to acknowledge.
+=== SCENE IMAGES (pre-described — these descriptions are physical ground truth) ===
+The user shared image(s) and a separate description pass converted each to the text below. These descriptions are the CANONICAL physical state of the scene — pose, position, clothing, who's where, what's touching what. Do NOT override or substitute generic alternatives. If the description says she's leaning back propped on her elbows, she IS leaning back propped on her elbows in your prose — not flat on her back, not sitting up. If the description says his hand is on her hip, his hand is on her hip — not her thigh, not her shoulder. The most common failure on image turns is the writing pass treating the description as flavor and reverting to default poses; don't.
 
 {blocks}
 
-Don't say "I can see...", "based on the image...", "the image shows..." or anything that breaks the fourth wall. Weave the visual details into your scene as if you'd always known them. Use your normal styling, length, voice, and planning — these descriptions don't change how you write, only what's in the scene.
+Weave the visual details into your scene as if you'd always known them. Don't break the fourth wall ("I can see...", "based on the image...", "the image shows..."). Use your normal styling, length, voice, and planning — the descriptions inform WHAT'S in the scene, not HOW you write.
 === END SCENE IMAGES ==="""
 
     if images_needing_inline_read:
