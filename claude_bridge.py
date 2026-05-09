@@ -2469,7 +2469,7 @@ def _update_session(char_key: str, session_id: str, messages: list):
 _load_sessions()
 
 
-def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None, skip_memory: bool = False) -> dict:
+def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None, skip_memory: bool = False, tracking_messages: list = None) -> dict:
     """
     Call Claude Code CLI with the given messages.
     Converts OpenAI message format to a prompt for Claude.
@@ -2812,11 +2812,21 @@ Use the Read tool to view each, then weave the visual details into your scene wi
     # system-prompt-file, relying on the CLI's own cached session state.
     # Gated on cli_session_reuse so users who see unexpected behavior can
     # opt out from the GUI without a code change.
+    #
+    # Resume + staging continuity decisions (here, _update_session below,
+    # memory_v2.stage_turn) all use `tracking_messages` — the ORIGINAL
+    # pre-rebuild message list. The model still sees `messages` (which may
+    # have been rebuilt by auto-summary), but tracking against the rebuilt
+    # list produces fixed-shape counts (system + summary + last 15) that
+    # confuse the delta + user-count heuristics. Tracking against the
+    # original messages keeps continuity stable across auto-summary cycles
+    # and across summary-threshold updates.
+    track = tracking_messages if tracking_messages is not None else messages
     resume_char_key = None
     resume_session_id = None
     resume_reason = "disabled by setting"
     if runtime_settings.get("cli_session_reuse", True):
-        resume_char_key, resume_session_id, resume_reason = _decide_resume(messages, char_key_override=char_key)
+        resume_char_key, resume_session_id, resume_reason = _decide_resume(track, char_key_override=char_key)
         if resume_session_id:
             if runtime_settings.get("debug_output"):
                 log(f"Resuming CLI session for [{resume_char_key}] ({resume_session_id[:8]}...): {resume_reason}", "INFO")
@@ -3168,8 +3178,12 @@ Use the Read tool to view each, then weave the visual details into your scene wi
                 # original pre-rebuild messages). Fall back to the resume
                 # decision's key (also override-aware), and only as a last
                 # resort compute from the possibly-rebuilt messages here.
-                persist_key = char_key or resume_char_key or get_character_key(messages)
-                _update_session(persist_key, captured_session_id, messages)
+                persist_key = char_key or resume_char_key or get_character_key(track)
+                # Persist counts against the ORIGINAL message list so the
+                # delta check on the next turn is comparing apples to apples.
+                # Without this, auto-summary's fixed-shape rebuild produces
+                # delta=0 every turn → invalidates the session forever.
+                _update_session(persist_key, captured_session_id, track)
             except Exception as e:
                 log(f"Could not persist CLI session: {e}", "WARN")
 
@@ -3196,11 +3210,18 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         # on the *next* request once we can confirm the user accepted it
         # (their next prompt will include this response in messages history).
         # Swipe/regen → buffer is discarded and replaced. See stage_turn().
+        #
+        # Pass `track` (the original pre-rebuild messages), not `messages`.
+        # The swipe-vs-accept detection in _flush_pending_if_accepted compares
+        # user-message counts between stage and the next request; using the
+        # rebuilt list here would compare against a fixed-shape window that
+        # doesn't reliably grow on accept, so accepts get mis-classified as
+        # swipes (or vice versa).
         if memory_v2_active and memory_v2_char_key and clean_response and clean_response.strip():
             try:
                 memory_v2.stage_turn(
                     char_key=memory_v2_char_key,
-                    messages=messages,
+                    messages=track,
                     assistant_response=clean_response,
                     char_name=memory_v2_char_key,
                 )
@@ -3459,6 +3480,16 @@ def chat_completions():
         except Exception:
             original_char_key = None
 
+        # Snapshot the ORIGINAL message list before any auto-summary or
+        # chunking rebuild. This gets passed to call_claude_code as
+        # `tracking_messages` so the CLI session-reuse decision and memory
+        # v2 staging compare turn-over-turn against the real conversation
+        # length, not the fixed-shape window auto-summary produces. Without
+        # this, every turn under auto-summary saw delta=0 and the session
+        # invalidated forever; memory v2 swipe detection mis-classified
+        # accepts and swipes interchangeably.
+        original_messages = list(messages)
+
         # Auto-summary mode - incremental summarization
         if runtime_settings.get("auto_summary_enabled", False) and not runtime_settings.get("chunking_enabled", False):
             use_summary, summary_text, recent_messages = process_auto_summary(messages)
@@ -3713,7 +3744,8 @@ Now, based on this context, please respond to the following request:
         def worker():
             try:
                 result_holder["result"] = call_claude_code(
-                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key, json_schema=json_schema
+                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key, json_schema=json_schema,
+                    tracking_messages=original_messages,
                 )
             except Exception as e:
                 log(f"Worker crashed: {e}", "ERROR")
