@@ -2341,47 +2341,6 @@ def _per_msg_prefix_sigs(messages: list, prefix_count: int) -> list:
     return sigs
 
 
-def _stored_content_intact_in(haystack: list, needle: list) -> tuple[bool, int]:
-    """Return (intact, new_msg_count) where intact is True if every signature
-    in `needle` appears in `haystack` at least as many times as it appears
-    in `needle`. new_msg_count is the count of haystack signatures that
-    aren't in needle (i.e. messages added since the session was captured).
-
-    Multiset (rather than contiguous-subsequence) comparison handles the
-    real failure mode: ST inserting a new intro card / persona note in the
-    middle of history. That breaks contiguity (an insertion mid-sequence
-    isn't a contiguous slice anymore) but the stored content is all still
-    present. Multiset confirms presence regardless of position.
-
-    The trade-off: a literal cut-and-paste reorder (move msg X from
-    position 5 to position 12) would still register as intact since the
-    multiset is unchanged. ST doesn't reorder messages in practice; this
-    is acceptable.
-    """
-    if not needle:
-        return True, len(haystack)
-    from collections import Counter
-    needle_counts = Counter(needle)
-    haystack_counts = Counter(haystack)
-    for sig, count in needle_counts.items():
-        if haystack_counts.get(sig, 0) < count:
-            return False, 0
-    new_msgs = sum(haystack_counts.values()) - sum(needle_counts.values())
-    return True, new_msgs
-
-
-def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
-    """Hash the first `prefix_count` user/assistant messages by content.
-
-    First 200 chars per message are enough; an edit virtually always
-    changes something near the start. Keeps the hash work cheap.
-    """
-    sigs = _per_msg_prefix_sigs(messages, prefix_count)
-    if not sigs:
-        return ""
-    return hashlib.md5("|".join(sigs).encode("utf-8", errors="ignore")).hexdigest()[:16]
-
-
 def _count_user_asst(messages: list) -> int:
     """Count user+assistant messages, skipping system entries."""
     return sum(1 for m in messages if m.get("role") in ("user", "assistant"))
@@ -2418,8 +2377,6 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
         session_id = entry.get("session_id")
         last_count = entry.get("last_message_count", 0)
         last_user_count = entry.get("last_user_count")
-        last_user_asst_count = entry.get("last_user_asst_count")
-        last_prefix_hash = entry.get("last_prefix_hash")
 
     if not session_id:
         return (char_key, None, "missing session_id")
@@ -2427,93 +2384,83 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     new_count = len(messages)
     delta = new_count - last_count
 
-    # Primary signal: user-message count delta. Real follow-ups always add
-    # at least one user message; swipes / rewinds / no-change replays don't.
-    # The OLD heuristic `delta in (1, 2)` was too strict — it invalidated
-    # legitimately on auto-summary's fixed-shape rebuild (delta=0) and on
-    # turns where ST inserted an intro card or persona note (delta>2).
-    # user_delta is the more reliable signal and the prefix-subseq check
-    # below catches actual content edits.
-    if last_user_count is not None:
-        new_user_count = _count_user_msgs(messages)
-        user_delta = new_user_count - last_user_count
-        if user_delta <= 0:
-            with _SESSION_LOCK:
-                SESSION_MAP.pop(char_key, None)
-                _save_sessions()
-            return (char_key, None, f"swipe/rewind detected (user_delta={user_delta}, total_delta={delta})")
-    elif delta not in (1, 2):
-        # Backwards compat: legacy entries without last_user_count fall
-        # back to the old delta heuristic for one turn (until the entry
-        # gets re-stamped on the next response).
+    # Bound the cached session's lifespan. The CLI's --resume keeps
+    # appending to the cached context; without a refresh, the model's
+    # cached view grows monotonically and contains the original raw
+    # history of every prior turn — which defeats auto-summary entirely
+    # (the bridge's prompt becomes summary+recent but the model's cache
+    # still has the originals). After SESSION_GROWTH_LIMIT messages of
+    # growth since the session was first established, force a fresh
+    # session — the next call will use the rebuilt summary+recent prompt
+    # and the cache will be sized down to that.
+    SESSION_GROWTH_LIMIT = 50
+    msgs_at_session_start = entry.get("messages_at_session_start", last_count)
+    session_growth = last_count - msgs_at_session_start
+    if session_growth >= SESSION_GROWTH_LIMIT:
         with _SESSION_LOCK:
             SESSION_MAP.pop(char_key, None)
             _save_sessions()
-        return (char_key, None, f"message delta {delta} invalidates session (legacy entry)")
+        return (char_key, None,
+                f"session age limit reached ({session_growth} msgs since establish, "
+                f"limit {SESSION_GROWTH_LIMIT}); refreshing for cache hygiene")
 
-    # Detect prefix edits: if the user changed an earlier message's content
-    # (without changing message counts), the CLI session's cached prefix is
-    # stale and must be invalidated — otherwise the model never sees the
-    # edit because --resume only sends the latest user message.
+    # Discriminate swipe / rewind / replay vs real follow-up by checking
+    # the LATEST user message in the new request:
     #
-    # Two-stage check:
-    #   1. Hash the first `last_user_asst_count` user+asst messages. If the
-    #      hash matches stored, fast-path resume.
-    #   2. If hashes differ, the prefix MAY have been edited OR it may have
-    #      just been shifted by an insertion (ST sometimes inserts intro
-    #      cards / persona notes / state messages mid-history that weren't
-    #      there the prior turn). Check if the stored sigs still appear as
-    #      a contiguous subsequence of the new full user/asst list. If yes
-    #      → insertion, content intact, resume OK. If no → real edit,
-    #      invalidate.
+    #   - If the last user msg's signature is in the stored sigs, it's a
+    #     swipe (ST replays the user msg unchanged). The user didn't
+    #     send anything new; we're being asked to regenerate the prior
+    #     turn → invalidate so the next call doesn't piggyback on the
+    #     cached response.
     #
-    # System messages are excluded from sigs throughout — ST's lorebook
-    # entries churn every turn and shouldn't drive invalidation.
-    if last_user_asst_count and last_prefix_hash:
-        new_prefix_hash = _hash_user_asst_prefix(messages, last_user_asst_count)
-        if new_prefix_hash and new_prefix_hash != last_prefix_hash:
-            stored_per_msg = entry.get("last_prefix_per_msg") or []
-            # Build the full new sig list (not truncated) so we can search
-            # for the stored sequence anywhere in it.
-            new_full_sigs = _per_msg_prefix_sigs(messages, prefix_count=10**9)
+    #   - If the last user msg's signature is NEW (not in stored sigs),
+    #     it's a genuine follow-up. Continue to the recent-tail check.
+    #
+    # This is more accurate than user_count delta. With auto-summary
+    # active, ST sometimes drops old user messages from the request (so
+    # user_count drops) but the new message at the end is still a real
+    # follow-up. The previous "user_delta <= 0 → swipe" heuristic
+    # invalidated those incorrectly.
+    stored_per_msg = entry.get("last_prefix_per_msg") or []
+    new_full_sigs = _per_msg_prefix_sigs(messages, prefix_count=10**9)
+    last_new_user_sig = None
+    for sig in reversed(new_full_sigs):
+        if sig.startswith("u:"):
+            last_new_user_sig = sig
+            break
+    if stored_per_msg and last_new_user_sig is not None:
+        if last_new_user_sig in stored_per_msg:
+            with _SESSION_LOCK:
+                SESSION_MAP.pop(char_key, None)
+                _save_sessions()
+            return (char_key, None,
+                    "swipe/replay detected (latest user msg matches a stored msg)")
 
-            intact, new_msg_count = _stored_content_intact_in(new_full_sigs, stored_per_msg)
-            if intact:
-                log(
-                    f"prefix hash differs but content intact: every stored sig is "
-                    f"present in the new {len(new_full_sigs)}-msg sequence "
-                    f"(+{new_msg_count} new). Likely an inserted intro/persona/lorebook "
-                    f"msg in the middle, not an edit. Allowing resume.",
-                    "INFO",
-                )
-                # Fall through — don't invalidate. Hash will be re-stamped
-                # on the next _update_session call after this turn succeeds.
-            else:
-                # Real edit: stored sequence doesn't appear in new — content
-                # was changed, not just inserted around. Diagnostic + bail.
-                try:
-                    diffs = []
-                    for i in range(min(len(stored_per_msg), last_user_asst_count, len(new_full_sigs))):
-                        if i >= len(stored_per_msg) or i >= len(new_full_sigs):
-                            break
-                        if stored_per_msg[i] != new_full_sigs[i]:
-                            diffs.append(i)
-                    log(
-                        f"prefix-edit diagnostic: {len(diffs)} of {last_user_asst_count} "
-                        f"msgs differ (positions {diffs[:5]}{'...' if len(diffs)>5 else ''}); "
-                        f"stored sequence does NOT appear in new — real edit",
-                        "INFO",
-                    )
-                    for i in diffs[:3]:
-                        if i < len(stored_per_msg) and i < len(new_full_sigs):
-                            log(f"  msg[{i}] stored: {stored_per_msg[i][:120]!r}", "INFO")
-                            log(f"  msg[{i}] now:    {new_full_sigs[i][:120]!r}", "INFO")
-                except Exception as e:
-                    log(f"prefix-edit diagnostic failed: {e}", "WARN")
-                with _SESSION_LOCK:
-                    SESSION_MAP.pop(char_key, None)
-                    _save_sessions()
-                return (char_key, None, "prefix edit detected (content hash changed)")
+    # Validate the RECENT tail of stored sigs is still in the new request.
+    # If the user edited a recent message, its old sig won't be in new and
+    # we invalidate. If old (ancient-history) messages got dropped or
+    # ST shifted things mid-history, the recent tail is unaffected and
+    # we resume — that's the right call since --resume only sends the
+    # latest user msg and the cache's continuity from recent context is
+    # what matters.
+    RECENT_VALIDATION_COUNT = 5
+    if stored_per_msg:
+        recent_to_check = stored_per_msg[-RECENT_VALIDATION_COUNT:]
+        new_sig_set = set(new_full_sigs)
+        missing = [s for s in recent_to_check if s not in new_sig_set]
+        if missing:
+            log(
+                f"recent-context check: {len(missing)} of {len(recent_to_check)} "
+                f"recent captured msg(s) not present in new request — "
+                f"likely an edit to a recent message. Invalidating.",
+                "INFO",
+            )
+            for s in missing[:3]:
+                log(f"  missing from new: {s[:120]!r}", "INFO")
+            with _SESSION_LOCK:
+                SESSION_MAP.pop(char_key, None)
+                _save_sessions()
+            return (char_key, None, "recent message edit detected")
 
     # Historically we also hashed system messages to invalidate when the
     # system prompt / preset / character card changed. That hash fired
@@ -2534,20 +2481,32 @@ def _update_session(char_key: str, session_id: str, messages: list):
     new_count = len(messages)
     new_user_count = _count_user_msgs(messages)
     new_user_asst_count = _count_user_asst(messages)
-    new_per_msg = _per_msg_prefix_sigs(messages, new_user_asst_count)
-    new_prefix_hash = _hash_user_asst_prefix(messages, new_user_asst_count)
+    # Only store the recent tail used by the resume check. Storing the
+    # full prefix turned out wrong: ST drops summarized-away messages
+    # from the request and the bridge would then invalidate every turn
+    # because old stored sigs weren't in the new request — but those
+    # old messages don't affect --resume anyway. Tail of 30 covers the
+    # default 5-msg recent-validation window with comfortable margin.
+    new_recent = _per_msg_prefix_sigs(messages, prefix_count=10**9)[-30:]
     with _SESSION_LOCK:
+        existing = SESSION_MAP.get(char_key, {})
+        # Track when the current session_id was first established. Same
+        # session_id (we're updating after a successful --resume) → keep
+        # the original start count. New session_id (CLI established a
+        # fresh session) → reset to current count. The resume decision
+        # uses this to bound session age so the cached context doesn't
+        # grow unbounded across many resumed turns.
+        if existing.get("session_id") == session_id:
+            messages_at_session_start = existing.get("messages_at_session_start", new_count)
+        else:
+            messages_at_session_start = new_count
         SESSION_MAP[char_key] = {
             "session_id": session_id,
             "last_message_count": new_count,
             "last_user_count": new_user_count,
             "last_user_asst_count": new_user_asst_count,
-            "last_prefix_hash": new_prefix_hash,
-            # Per-msg signatures kept alongside the hash so the diagnostic
-            # can show exactly which message(s) differ when a hash mismatch
-            # fires. The list is bounded by user_asst_count (typically
-            # hundreds of strings, ~200 chars each — bounded by chat length).
-            "last_prefix_per_msg": new_per_msg,
+            "last_prefix_per_msg": new_recent,
+            "messages_at_session_start": messages_at_session_start,
             "updated_at": time.time(),
         }
         _save_sessions()
