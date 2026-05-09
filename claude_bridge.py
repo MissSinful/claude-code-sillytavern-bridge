@@ -2542,17 +2542,14 @@ Respond directly with the narrative. Do NOT use <think> tags or write planning n
         image_paths_list = '\n'.join([f"  - {p}" for p in all_image_paths])
         prompt += f"""
 
-=== IMAGE HANDLING (CRITICAL) ===
-The user shared image(s) in this conversation. You MUST:
-1. Use the Read tool to view each image file listed below BEFORE writing your response
-2. After viewing, incorporate what you see (positioning, scene, context) directly into your narrative response
-3. Do NOT describe the image separately. Do NOT say "Let me view the image" or "I can see...". Do NOT write a standalone image description.
-4. Simply weave what you observe into your roleplay response naturally, as if you always knew what was in the image.
-5. Your ENTIRE output should be the narrative/RP response. Nothing else.
+=== IMAGES IN SCENE ===
+The user shared image(s). Use the Read tool on each file path below to view them, then continue your turn normally — same formatting, same voice, same length, same styling (HTML / colored spans / italics / inline blocks etc.) as any other turn. The image is just additional scene context, not a special operating mode.
 
-Image files to view:
+Don't describe the image explicitly ("I can see...", "Let me view the image..."), don't write a standalone description, don't acknowledge that an image was shared. Incorporate what you see into the scene as if you'd always known it.
+
+Files to view:
 {image_paths_list}
-=== END IMAGE HANDLING ==="""
+=== END IMAGES IN SCENE ==="""
 
     # Character Memory: out-of-band Sonnet librarian curates the injection
     # before each turn and stages the response for post-turn maintenance.
