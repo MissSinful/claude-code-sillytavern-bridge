@@ -2321,18 +2321,13 @@ def _msg_text(m: dict) -> str:
     return str(content) if content is not None else ""
 
 
-def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
-    """Hash the first `prefix_count` user/assistant messages by content.
-
-    Skips system messages because ST inserts/removes lorebook system
-    entries between turns, which would invalidate the cache spuriously
-    every turn for any user with World Info active. User+assistant content
-    only changes when the user explicitly edits the chat — that's the
-    signal we actually want to catch.
-
-    First 200 chars per message are enough; an edit virtually always
-    changes something near the start. Keeps the hash work cheap.
-    """
+def _per_msg_prefix_sigs(messages: list, prefix_count: int) -> list:
+    """Build the per-message signatures used by both the prefix hash and the
+    diagnostic. Returns a list of `<role-initial>:<first-200-chars>` strings,
+    one per user/assistant message up to prefix_count. System messages are
+    skipped because ST churns them every turn (lorebook entries, persona
+    notes etc.) and that churn is benign — only user/assistant content edits
+    should invalidate the session."""
     sigs = []
     count = 0
     for m in messages:
@@ -2342,6 +2337,16 @@ def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
             break
         sigs.append(f"{m['role'][0]}:{_msg_text(m)[:200]}")
         count += 1
+    return sigs
+
+
+def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
+    """Hash the first `prefix_count` user/assistant messages by content.
+
+    First 200 chars per message are enough; an edit virtually always
+    changes something near the start. Keeps the hash work cheap.
+    """
+    sigs = _per_msg_prefix_sigs(messages, prefix_count)
     if not sigs:
         return ""
     return hashlib.md5("|".join(sigs).encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -2429,6 +2434,34 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     if last_user_asst_count and last_prefix_hash:
         new_prefix_hash = _hash_user_asst_prefix(messages, last_user_asst_count)
         if new_prefix_hash and new_prefix_hash != last_prefix_hash:
+            # Diagnostic: which message(s) actually differ? Log per-message
+            # signatures so we can see whether this is a real edit or some
+            # benign churn (macro expansion, persona note re-render, etc.)
+            # that should be tolerated rather than invalidated.
+            try:
+                stored_per_msg = entry.get("last_prefix_per_msg") or []
+                new_per_msg = _per_msg_prefix_sigs(messages, last_user_asst_count)
+                diffs = []
+                for i in range(min(len(stored_per_msg), len(new_per_msg))):
+                    if stored_per_msg[i] != new_per_msg[i]:
+                        diffs.append(i)
+                if diffs:
+                    log(
+                        f"prefix-edit diagnostic: {len(diffs)} of {last_user_asst_count} "
+                        f"msgs differ (positions {diffs[:5]}{'...' if len(diffs)>5 else ''})",
+                        "INFO",
+                    )
+                    for i in diffs[:3]:
+                        log(f"  msg[{i}] stored: {stored_per_msg[i][:120]!r}", "INFO")
+                        log(f"  msg[{i}] now:    {new_per_msg[i][:120]!r}", "INFO")
+                else:
+                    log(
+                        "prefix-edit diagnostic: hashes differ but per-msg sigs identical "
+                        "(maybe length-mismatch or stored sigs absent)",
+                        "INFO",
+                    )
+            except Exception as e:
+                log(f"prefix-edit diagnostic failed: {e}", "WARN")
             with _SESSION_LOCK:
                 SESSION_MAP.pop(char_key, None)
                 _save_sessions()
@@ -2453,6 +2486,7 @@ def _update_session(char_key: str, session_id: str, messages: list):
     new_count = len(messages)
     new_user_count = _count_user_msgs(messages)
     new_user_asst_count = _count_user_asst(messages)
+    new_per_msg = _per_msg_prefix_sigs(messages, new_user_asst_count)
     new_prefix_hash = _hash_user_asst_prefix(messages, new_user_asst_count)
     with _SESSION_LOCK:
         SESSION_MAP[char_key] = {
@@ -2461,6 +2495,11 @@ def _update_session(char_key: str, session_id: str, messages: list):
             "last_user_count": new_user_count,
             "last_user_asst_count": new_user_asst_count,
             "last_prefix_hash": new_prefix_hash,
+            # Per-msg signatures kept alongside the hash so the diagnostic
+            # can show exactly which message(s) differ when a hash mismatch
+            # fires. The list is bounded by user_asst_count (typically
+            # hundreds of strings, ~200 chars each — bounded by chat length).
+            "last_prefix_per_msg": new_per_msg,
             "updated_at": time.time(),
         }
         _save_sessions()
