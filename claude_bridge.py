@@ -2542,14 +2542,20 @@ Respond directly with the narrative. Do NOT use <think> tags or write planning n
         image_paths_list = '\n'.join([f"  - {p}" for p in all_image_paths])
         prompt += f"""
 
-=== IMAGES IN SCENE ===
-The user shared image(s). Use the Read tool on each file path below to view them, then continue your turn normally — same formatting, same voice, same length, same styling (HTML / colored spans / italics / inline blocks etc.) as any other turn. The image is just additional scene context, not a special operating mode.
-
-Don't describe the image explicitly ("I can see...", "Let me view the image..."), don't write a standalone description, don't acknowledge that an image was shared. Incorporate what you see into the scene as if you'd always known it.
-
-Files to view:
+=== SCENE IMAGES ===
+Files to view via the Read tool for visual scene context:
 {image_paths_list}
-=== END IMAGES IN SCENE ==="""
+
+CRITICAL — the failure mode this prompt is trying to prevent:
+On image turns, models tend to short-circuit to "tool task done, now write narration." The thinking block collapses into one line ("user shared an image, let me check"), planning gets skipped, and the response comes out flatter, drier, and stripped of the styling (HTML / colored spans / italics / inline blocks) that the system prompt and preset establish for non-image turns. DO NOT do this here.
+
+The Read call is just additional input, not the work product. After viewing the images:
+- Open <think> and do your FULL normal planning pass — beat planning, character state, format choices, the works. The image observation is one note among many in there, not the entire content of the block.
+- Close </think> and write the response with the SAME length, voice, pacing, paragraph rhythm, and styling (HTML / colored spans / italics / inline blocks / kaomoji thought blocks / whatever your preset uses) as a no-image turn. If you'd write a colored dialogue line on a normal turn, write one here.
+- Don't describe the image explicitly ("I can see...", "Let me view the image..."), don't write a standalone description, don't acknowledge that an image was shared. Incorporate what you see as if you'd always known it.
+
+The image-turn response should be indistinguishable from a normal turn in everything except the scene content informed by the image.
+=== END SCENE IMAGES ==="""
 
     # Character Memory: out-of-band Sonnet librarian curates the injection
     # before each turn and stages the response for post-turn maintenance.
