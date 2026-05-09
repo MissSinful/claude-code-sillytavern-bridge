@@ -2404,23 +2404,22 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
                 f"session age limit reached ({session_growth} msgs since establish, "
                 f"limit {SESSION_GROWTH_LIMIT}); refreshing for cache hygiene")
 
-    # Discriminate swipe / rewind / replay vs real follow-up by checking
-    # the LATEST user message in the new request:
+    # Discriminate swipe / replay vs real follow-up by comparing the
+    # LATEST user message in the new request against the latest user
+    # message at session capture:
     #
-    #   - If the last user msg's signature is in the stored sigs, it's a
-    #     swipe (ST replays the user msg unchanged). The user didn't
-    #     send anything new; we're being asked to regenerate the prior
-    #     turn → invalidate so the next call doesn't piggyback on the
-    #     cached response.
+    #   - SAME content → ST is replaying the user msg unchanged (swipe).
+    #     Invalidate so the next call doesn't piggyback on the cached
+    #     response.
     #
-    #   - If the last user msg's signature is NEW (not in stored sigs),
-    #     it's a genuine follow-up. Continue to the recent-tail check.
+    #   - DIFFERENT content → genuine follow-up. Continue to the
+    #     recent-tail check.
     #
-    # This is more accurate than user_count delta. With auto-summary
-    # active, ST sometimes drops old user messages from the request (so
-    # user_count drops) but the new message at the end is still a real
-    # follow-up. The previous "user_delta <= 0 → swipe" heuristic
-    # invalidated those incorrectly.
+    # Only the LATEST stored user sig is compared, not all stored sigs.
+    # Comparing against all stored sigs false-positives on common short
+    # messages ("ok", "yes", "continue") that the user has typed before
+    # — any prior occurrence in stored would falsely look like a swipe.
+    # A real swipe specifically replays the immediately-prior user msg.
     stored_per_msg = entry.get("last_prefix_per_msg") or []
     new_full_sigs = _per_msg_prefix_sigs(messages, prefix_count=10**9)
     last_new_user_sig = None
@@ -2428,13 +2427,19 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
         if sig.startswith("u:"):
             last_new_user_sig = sig
             break
-    if stored_per_msg and last_new_user_sig is not None:
-        if last_new_user_sig in stored_per_msg:
-            with _SESSION_LOCK:
-                SESSION_MAP.pop(char_key, None)
-                _save_sessions()
-            return (char_key, None,
-                    "swipe/replay detected (latest user msg matches a stored msg)")
+    last_stored_user_sig = None
+    for sig in reversed(stored_per_msg):
+        if sig.startswith("u:"):
+            last_stored_user_sig = sig
+            break
+    if (last_stored_user_sig is not None
+            and last_new_user_sig is not None
+            and last_new_user_sig == last_stored_user_sig):
+        with _SESSION_LOCK:
+            SESSION_MAP.pop(char_key, None)
+            _save_sessions()
+        return (char_key, None,
+                "swipe/replay detected (latest user msg unchanged from capture)")
 
     # Validate the RECENT tail of stored sigs is still in the new request.
     # If the user edited a recent message, its old sig won't be in new and
