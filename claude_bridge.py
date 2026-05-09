@@ -3558,16 +3558,18 @@ The above summarizes the story so far. Continue from the recent messages below."
                         chunk_chars = sum(len(m.get("content", "")) for m in chunk)
                         log(f"  Chunk {i+1}: {len(chunk)} messages, {chunk_chars:,} chars")
 
-                    # Process each chunk for summary
+                    # Process each chunk for summary. Old images from earlier
+                    # turns aren't relevant to the chunk summary — they were
+                    # already factored into the assistant responses being
+                    # summarized — and passing them through call_claude_code
+                    # would trigger the image describer pre-pass on multi-
+                    # megabyte payloads. Strip embedded base64 from chunk_text
+                    # AFTER the f-string concatenation, because multipart
+                    # messages have list-typed content (with image_url parts)
+                    # that gets stringified by f-string into something like
+                    # `[{'type':'image_url','image_url':{'url':'data:image/...'}}]`
+                    # and the base64 leaks through if we only strip strings.
                     chunk_results = []
-                    # Strip embedded base64 image data from each chunk before
-                    # summarization. Old images from earlier turns aren't
-                    # relevant to the chunk summary (they were already factored
-                    # into the assistant responses being summarized), and
-                    # passing them through call_claude_code would trigger the
-                    # image describer pre-pass on multi-megabyte payloads —
-                    # plus crash if any path returns tuples. Cheap regex
-                    # replacement here keeps chunking purely textual.
                     base64_image_pattern = re.compile(
                         r'data:image/(?:png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+',
                         re.IGNORECASE,
@@ -3575,14 +3577,17 @@ The above summarizes the story so far. Continue from the recent messages below."
                     for i, chunk in enumerate(chunks, 1):
                         log(f"Processing chunk {i}/{len(chunks)}...")
 
-                        # Format chunk as text, stripping any embedded images.
+                        # Format chunk as text, then strip any base64 (handles
+                        # both string-content and stringified-list-content cases).
                         chunk_text = ""
                         for msg in chunk:
                             role = msg.get("role", "user").upper()
                             content = msg.get("content", "")
-                            if isinstance(content, str):
-                                content = base64_image_pattern.sub("[image]", content)
                             chunk_text += f"[{role}]: {content}\n\n"
+                        before_len = len(chunk_text)
+                        chunk_text = base64_image_pattern.sub("[image]", chunk_text)
+                        if len(chunk_text) != before_len:
+                            log(f"  Stripped embedded base64 image data from chunk {i} ({before_len - len(chunk_text):,} chars)")
 
                         prompt = load_prompt(
                             "summarize_chunk",
