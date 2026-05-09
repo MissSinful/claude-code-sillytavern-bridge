@@ -1850,6 +1850,36 @@ Follow any structured thinking formats or protocols in the system prompt precise
 CRITICAL THINKING/PLANNING RULE: ALL planning, reasoning, context notes, character tracking, social dynamics, and internal analysis MUST go inside <think></think> tags. Do NOT close the </think> tag until ALL of your thinking is complete. If your system prompt defines structured sections like [Tools], [Context], [Social], etc., ALL of those sections must be inside a SINGLE <think> block. After you close </think>, your ENTIRE output must be pure narrative/roleplay - zero planning, zero meta-commentary, zero structured notes. If it's not dialogue or narration, it belongs inside <think>."""
 
 
+# Default planning-and-format guidance the bridge appends at the end of
+# each request when include_thinking is True. Tells the model how to use
+# <think>...</think> and reminds it that narrative output is mandatory.
+# Single source of truth for both the request handler (via
+# runtime_settings.thinking_prompt fallback) and the GUI (exposed through
+# /api/settings/default_thinking_prompt).
+DEFAULT_THINKING_PROMPT = """=== YOUR RESPONSE ===
+Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
+
+PLANNING + RESPONSE FORMAT:
+You may plan briefly inside a <think>...</think> block before writing the narrative. Keep planning short — a paragraph or two of free-form notes is plenty. No structured sections, no per-character templates, no exhaustive analysis: the heavy character/world tracking is already handled out-of-band and injected for you. Just orient yourself, decide the beat, then write.
+
+CRITICAL — NARRATIVE OUTPUT IS MANDATORY:
+Your response MUST contain narrative prose AFTER </think> closes. A response that is only <think>...</think> with no narrative after is a hard failure — the user sees nothing, the scene breaks, the turn is wasted.
+- Always close </think> before writing narrative. Always write narrative after it.
+- If you catch yourself adding "one more section" to the planning, stop. Close the tag and write.
+- The narrative is the actual response. Without it, you have produced nothing.
+
+Now: think briefly if needed, close </think>, and write the scene."""
+
+
+# Default block used when include_thinking is False — tells the model to
+# skip <think> entirely. Editable via runtime_settings.no_thinking_prompt
+# / GUI / /api/settings/default_no_thinking_prompt.
+DEFAULT_NO_THINKING_PROMPT = """=== YOUR RESPONSE ===
+Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
+
+Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response."""
+
+
 # Effort level: "low", "medium", "high", "xhigh", or "max"
 # xhigh and max require Opus 4.7; on older models Claude Code falls back
 # to the highest supported level at or below the requested one.
@@ -1893,6 +1923,13 @@ runtime_settings = {
     "lorebook_name": "claude_auto_lore.json",
     # Custom system prompt (empty = use default)
     "system_prompt_override": "",
+    # Custom planning + response-format guidance appended at the end of each
+    # prompt. Two variants — one for when include_thinking is True (the
+    # model is told how to use <think> tags), one for when it's False (told
+    # to skip <think> entirely). Empty string = use the default constant.
+    # Editable via the GUI System Prompt tab.
+    "thinking_prompt": "",
+    "no_thinking_prompt": "",
     # Creativity level: "precise", "balanced", "creative", "wild"
     "creativity": "balanced",
     # Bridge HTTP server port (persisted; requires restart to apply)
@@ -1936,7 +1973,8 @@ PERSISTED_SETTING_KEYS = {
     "effort_level", "include_thinking", "show_thinking_console", "debug_output",
     "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold",
     "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name",
-    "system_prompt_override", "creativity", "bridge_port",
+    "system_prompt_override", "thinking_prompt", "no_thinking_prompt",
+    "creativity", "bridge_port",
     "cli_session_reuse", "update_check_enabled",
     "character_memory_v2_enabled", "pinned_char_key",
 }
@@ -2589,31 +2627,20 @@ Push boundaries. Be unpredictable, experimental, and bold. Take dramatic narrati
             tool_section = f"\n\n{TOOL_CALLING_INSTRUCTIONS}\n{tool_definitions}\n"
             log(f"Tools provided: {len(tools)} tools")
 
-        # Thinking guidance — only when the bridge has thinking enabled. The
-        # block deliberately avoids prescribing structured sections (no
-        # [Tools]/[Context]/etc.); past experience with rigid CoT templates
-        # is that the model exhausts the visible-output budget filling
-        # sections and never reaches narrative. Keeping it loose lets the
-        # model self-pace its planning.
+        # Thinking guidance — pulled from runtime_settings so the user can
+        # customize it via the GUI. Falls back to the bundled default when
+        # the setting is empty (matches the system_prompt_override pattern).
+        # See DEFAULT_THINKING_PROMPT / DEFAULT_NO_THINKING_PROMPT constants.
         if runtime_settings.get("include_thinking", True):
-            response_section = """=== YOUR RESPONSE ===
-Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
-
-PLANNING + RESPONSE FORMAT:
-You may plan briefly inside a <think>...</think> block before writing the narrative. Keep planning short — a paragraph or two of free-form notes is plenty. No structured sections, no per-character templates, no exhaustive analysis: the heavy character/world tracking is already handled out-of-band and injected for you. Just orient yourself, decide the beat, then write.
-
-CRITICAL — NARRATIVE OUTPUT IS MANDATORY:
-Your response MUST contain narrative prose AFTER </think> closes. A response that is only <think>...</think> with no narrative after is a hard failure — the user sees nothing, the scene breaks, the turn is wasted.
-- Always close </think> before writing narrative. Always write narrative after it.
-- If you catch yourself adding "one more section" to the planning, stop. Close the tag and write.
-- The narrative is the actual response. Without it, you have produced nothing.
-
-Now: think briefly if needed, close </think>, and write the scene."""
+            response_section = (
+                runtime_settings.get("thinking_prompt", "").strip()
+                or DEFAULT_THINKING_PROMPT
+            )
         else:
-            response_section = """=== YOUR RESPONSE ===
-Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
-
-Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response."""
+            response_section = (
+                runtime_settings.get("no_thinking_prompt", "").strip()
+                or DEFAULT_NO_THINKING_PROMPT
+            )
 
         # Include full system prompt in the conversation
         prompt = f"""=== SYSTEM PROMPT (FOLLOW EXACTLY) ===
@@ -3860,6 +3887,18 @@ def get_default_system_prompt():
     return jsonify({"default_system_prompt": DEFAULT_BRIDGE_SYSTEM_PROMPT})
 
 
+@app.route("/api/settings/default_thinking_prompt", methods=["GET"])
+def get_default_thinking_prompt():
+    """Return the canonical default planning + format guidance (thinking on)."""
+    return jsonify({"default_thinking_prompt": DEFAULT_THINKING_PROMPT})
+
+
+@app.route("/api/settings/default_no_thinking_prompt", methods=["GET"])
+def get_default_no_thinking_prompt():
+    """Return the canonical default response framing (thinking off)."""
+    return jsonify({"default_no_thinking_prompt": DEFAULT_NO_THINKING_PROMPT})
+
+
 @app.route("/api/version", methods=["GET"])
 def get_version():
     """Return bridge version + latest-release info for the GUI update banner."""
@@ -3881,7 +3920,7 @@ def update_settings():
         log(f"CHUNKING: {old_val} -> {new_val}")
 
     memory_v2_was_enabled = runtime_settings.get("character_memory_v2_enabled", False)
-    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "creativity", "bridge_port", "cli_session_reuse", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key"]:
+    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "thinking_prompt", "no_thinking_prompt", "creativity", "bridge_port", "cli_session_reuse", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key"]:
         if key in data:
             # Coerce bridge_port to int and bounds-check. Invalid values are rejected.
             if key == "bridge_port":
