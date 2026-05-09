@@ -2346,6 +2346,41 @@ def _count_user_asst(messages: list) -> int:
     return sum(1 for m in messages if m.get("role") in ("user", "assistant"))
 
 
+# Preset-injection patterns to ignore when identifying the user's actual
+# reply for swipe detection. ST presets (Celia, Storyteller, etc.) wrap
+# every turn with marker messages and a fixed-content "author instruction"
+# block — those appear at the same positions every turn and are byte-
+# identical between turns. Without this filter, the swipe check picks up
+# the constant instruction block as the "latest user msg" and falsely
+# concludes every turn is a replay.
+_ST_INJECTION_PREFIXES = ("<turn>", "<latest_turn", "[ooc", "(ooc")
+_ST_INJECTION_SUBSTRINGS = ("vital that author", "past events:", "story summary:")
+
+
+def _sig_is_st_injection(sig: str) -> bool:
+    """True if this signature looks like an ST preset injection rather than
+    the user's actual chat reply. Mirrors the equivalent logic in
+    memory_v2.find_npcs_in_scene's injection skip."""
+    if not sig or len(sig) < 2:
+        return False
+    content = sig[2:]  # strip "u:" / "a:" role prefix
+    low = content.lower().strip()
+    if any(low.startswith(p) for p in _ST_INJECTION_PREFIXES):
+        return True
+    if any(s in low for s in _ST_INJECTION_SUBSTRINGS):
+        return True
+    return False
+
+
+def _last_real_user_sig(sigs: list):
+    """Find the last user-role signature that ISN'T a preset injection.
+    Returns None if no real user msg found."""
+    for sig in reversed(sigs):
+        if sig.startswith("u:") and not _sig_is_st_injection(sig):
+            return sig
+    return None
+
+
 def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     """Return (char_key, session_id_or_None, reason).
 
@@ -2422,16 +2457,13 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
     # A real swipe specifically replays the immediately-prior user msg.
     stored_per_msg = entry.get("last_prefix_per_msg") or []
     new_full_sigs = _per_msg_prefix_sigs(messages, prefix_count=10**9)
-    last_new_user_sig = None
-    for sig in reversed(new_full_sigs):
-        if sig.startswith("u:"):
-            last_new_user_sig = sig
-            break
-    last_stored_user_sig = None
-    for sig in reversed(stored_per_msg):
-        if sig.startswith("u:"):
-            last_stored_user_sig = sig
-            break
+    # Use the last REAL user msg (skipping ST preset injections like
+    # <latest_turn_end> markers and "Vital that author" instruction
+    # blocks). Without this skip, the constant injection block at the
+    # tail looks identical between turns and trips swipe detection on
+    # every real reply.
+    last_new_user_sig = _last_real_user_sig(new_full_sigs)
+    last_stored_user_sig = _last_real_user_sig(stored_per_msg)
     if (last_stored_user_sig is not None
             and last_new_user_sig is not None
             and last_new_user_sig == last_stored_user_sig):
