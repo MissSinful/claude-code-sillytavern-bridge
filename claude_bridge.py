@@ -384,6 +384,72 @@ Image file: {image_path}"""
     log("Failed to generate image description, using fallback", "WARN")
     return f"[An image was shared at: {image_path} - use Read tool to view it]"
 
+
+# =============================================================================
+# IMAGE DESCRIPTION CACHE
+# =============================================================================
+# describe_image() runs a separate Claude subprocess with the Read tool to
+# generate a text description of an image. We pre-call it before the main
+# response turn so the main turn doesn't need Read enabled — getting the
+# model out of "tool-use mode" preserves the response format (HTML / colored
+# spans / styled blocks) that otherwise gets stripped on image turns.
+#
+# Per-image cost is one subprocess + a Sonnet-class round trip (~2-5s).
+# Cached on disk by file path, so re-using the same image across many turns
+# only pays once. ST's image filenames in temp_images/ are unique per share
+# so there's no collision risk.
+
+_IMAGE_DESC_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cache", "image_descriptions.json"
+)
+_IMAGE_DESC_CACHE: dict[str, str] = {}
+_IMAGE_DESC_LOCK = threading.Lock()
+
+
+def _load_image_desc_cache():
+    global _IMAGE_DESC_CACHE
+    if not os.path.exists(_IMAGE_DESC_CACHE_FILE):
+        return
+    try:
+        with open(_IMAGE_DESC_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _IMAGE_DESC_CACHE = {str(k): str(v) for k, v in data.items() if v}
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"image desc cache read failed: {e}", "WARN")
+
+
+def _save_image_desc_cache():
+    try:
+        os.makedirs(os.path.dirname(_IMAGE_DESC_CACHE_FILE), exist_ok=True)
+        with open(_IMAGE_DESC_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_IMAGE_DESC_CACHE, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        log(f"image desc cache write failed: {e}", "WARN")
+
+
+def get_or_describe_image(image_path: str) -> str:
+    """Cached wrapper around describe_image. Returns description text or a
+    fallback marker (starts with `[An image was shared`) when description
+    fails — caller can detect the marker and fall back to the Read-tool
+    inline path for that image."""
+    with _IMAGE_DESC_LOCK:
+        cached = _IMAGE_DESC_CACHE.get(image_path)
+    if cached:
+        return cached
+    desc = describe_image(image_path)
+    # Don't cache fallback markers — we want to retry next turn in case
+    # the refusal was transient.
+    if desc and not desc.startswith("[An image was shared"):
+        with _IMAGE_DESC_LOCK:
+            _IMAGE_DESC_CACHE[image_path] = desc
+            _save_image_desc_cache()
+    return desc
+
+
+_load_image_desc_cache()
+
+
 # =============================================================================
 # SUMMARY CACHE
 # =============================================================================
@@ -2538,24 +2604,53 @@ Respond directly with the narrative. Do NOT use <think> tags or write planning n
 {response_section}"""
 
     # Add image viewing instructions if there are unprocessed images
+    # Pre-read images out of band so the main response turn doesn't need
+    # the Read tool. Image turns where the model uses Read inline drop
+    # into "tool-use mode" and produce shorter <think>, less planning,
+    # and stripped formatting (HTML / colored spans / styled blocks) —
+    # because the model treats the read as the work product rather than
+    # routine context. Pre-reading converts each image to text up front;
+    # the main response then sees descriptions as plain prose context,
+    # same as anything from the conversation history.
+    image_descriptions: list[tuple[str, str]] = []
+    images_needing_inline_read: list[str] = []
     if all_image_paths:
-        image_paths_list = '\n'.join([f"  - {p}" for p in all_image_paths])
+        for p in all_image_paths:
+            desc = get_or_describe_image(p)
+            if desc and not desc.startswith("[An image was shared"):
+                image_descriptions.append((p, desc))
+            else:
+                # Pre-read failed (refusal, timeout, error). Fall back to
+                # letting the main turn use Read for this specific image.
+                images_needing_inline_read.append(p)
+
+    if image_descriptions:
+        blocks = "\n\n".join(
+            f"Image — {os.path.basename(p)}:\n{desc.strip()}"
+            for p, desc in image_descriptions
+        )
         prompt += f"""
 
-=== SCENE IMAGES ===
-Files to view via the Read tool for visual scene context:
-{image_paths_list}
+=== SCENE IMAGES (pre-described — incorporate as context) ===
+The user shared image(s) earlier. Each was viewed by a separate description pass and converted to the text below. Treat these descriptions exactly like anything from the conversation history — they're scene context, not an event to acknowledge.
 
-CRITICAL — the failure mode this prompt is trying to prevent:
-On image turns, models tend to short-circuit to "tool task done, now write narration." The thinking block collapses into one line ("user shared an image, let me check"), planning gets skipped, and the response comes out flatter, drier, and stripped of the styling (HTML / colored spans / italics / inline blocks) that the system prompt and preset establish for non-image turns. DO NOT do this here.
+{blocks}
 
-The Read call is just additional input, not the work product. After viewing the images:
-- Open <think> and do your FULL normal planning pass — beat planning, character state, format choices, the works. The image observation is one note among many in there, not the entire content of the block.
-- Close </think> and write the response with the SAME length, voice, pacing, paragraph rhythm, and styling (HTML / colored spans / italics / inline blocks / kaomoji thought blocks / whatever your preset uses) as a no-image turn. If you'd write a colored dialogue line on a normal turn, write one here.
-- Don't describe the image explicitly ("I can see...", "Let me view the image..."), don't write a standalone description, don't acknowledge that an image was shared. Incorporate what you see as if you'd always known it.
-
-The image-turn response should be indistinguishable from a normal turn in everything except the scene content informed by the image.
+Don't say "I can see...", "based on the image...", "the image shows..." or anything that breaks the fourth wall. Weave the visual details into your scene as if you'd always known them. Use your normal styling, length, voice, and planning — these descriptions don't change how you write, only what's in the scene.
 === END SCENE IMAGES ==="""
+
+    if images_needing_inline_read:
+        # Fallback path: pre-read failed for one or more images. Tell the
+        # main turn to Read those specific paths. This is the old behavior,
+        # used only when the description pre-pass refused or errored.
+        fallback_list = "\n".join(f"  - {p}" for p in images_needing_inline_read)
+        prompt += f"""
+
+=== SCENE IMAGES (fallback — pre-read failed; use Read inline) ===
+{fallback_list}
+
+Use the Read tool to view each, then weave the visual details into your scene without acknowledging that an image was shared. Keep the same styling and planning depth as a non-image turn.
+=== END SCENE IMAGES (FALLBACK) ==="""
 
     # Character Memory: out-of-band Sonnet librarian curates the injection
     # before each turn and stages the response for post-turn maintenance.
@@ -2597,11 +2692,14 @@ The image-turn response should be indistinguishable from a normal turn in everyt
                 # instruction Opus sees before generating.
                 prompt += "\n\n" + injection_text
 
-    # Determine which tools to enable. Read is needed for image viewing.
-    # Memory v2 does its bookkeeping out-of-band via memory_v2.stage_turn,
-    # so the model itself never touches the DB and needs no extra tools.
+    # Determine which tools to enable. Images are pre-described out of band
+    # so the main turn doesn't need Read — this prevents the format-stripping
+    # "tool-use mode" that image turns otherwise drop into. Read is only
+    # added when the description pre-pass failed (refusal, timeout, etc.)
+    # so the main turn can fall back to inline Read for those specific paths.
+    # Memory v2 does its bookkeeping out-of-band, so it needs no tools.
     tool_set = []
-    if all_image_paths:
+    if images_needing_inline_read:
         tool_set.append("Read")
     tools_arg = ",".join(tool_set)
 
