@@ -2556,7 +2556,13 @@ def call_claude_code(messages: list, tools: list = None, process_holder: dict = 
                 if "data:image" in content and runtime_settings.get("debug_output"):
                     log(f"  Found base64 image data in string content at index {idx}")
                 content, img_paths = extract_and_save_images(content)
-                all_image_paths.extend(img_paths)
+                # extract_and_save_images returns (filepath, hash) tuples;
+                # all_image_paths is consumed downstream as a list of plain
+                # path strings (get_or_describe_image, the SCENE IMAGES
+                # block, etc.), so unpack here. Keeping tuples in caused
+                # describe_image() to fail with `'tuple' object has no
+                # attribute 'lower'` when it tried image_path.lower().
+                all_image_paths.extend(t[0] for t in img_paths)
             else:
                 # For older messages, just clean out any base64 data but don't process
                 # Replace old [IMAGE: path] markers with a note
@@ -3554,14 +3560,28 @@ The above summarizes the story so far. Continue from the recent messages below."
 
                     # Process each chunk for summary
                     chunk_results = []
+                    # Strip embedded base64 image data from each chunk before
+                    # summarization. Old images from earlier turns aren't
+                    # relevant to the chunk summary (they were already factored
+                    # into the assistant responses being summarized), and
+                    # passing them through call_claude_code would trigger the
+                    # image describer pre-pass on multi-megabyte payloads —
+                    # plus crash if any path returns tuples. Cheap regex
+                    # replacement here keeps chunking purely textual.
+                    base64_image_pattern = re.compile(
+                        r'data:image/(?:png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+',
+                        re.IGNORECASE,
+                    )
                     for i, chunk in enumerate(chunks, 1):
                         log(f"Processing chunk {i}/{len(chunks)}...")
 
-                        # Format chunk as text
+                        # Format chunk as text, stripping any embedded images.
                         chunk_text = ""
                         for msg in chunk:
                             role = msg.get("role", "user").upper()
                             content = msg.get("content", "")
+                            if isinstance(content, str):
+                                content = base64_image_pattern.sub("[image]", content)
                             chunk_text += f"[{role}]: {content}\n\n"
 
                         prompt = load_prompt(
