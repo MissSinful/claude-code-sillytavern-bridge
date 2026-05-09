@@ -1862,6 +1862,9 @@ Follow the system prompt above precisely. Characters stay in character - if they
 PLANNING + RESPONSE FORMAT:
 You may plan briefly inside a <think>...</think> block before writing the narrative. Keep planning short — a paragraph or two of free-form notes is plenty. No structured sections, no per-character templates, no exhaustive analysis: the heavy character/world tracking is already handled out-of-band and injected for you. Just orient yourself, decide the beat, then write.
 
+FORMAT CONSISTENCY — read this, it's a frequent failure:
+Match the styling, length, and pacing of recent assistant turns. If prior turns used location blocks, colored dialogue, character-color thought blocks, span styling, kaomoji, italics, status screens, or any other formatting, KEEP using them. Don't drift toward simpler formatting because the moment seems quieter, because you're tired of the structure, or because nothing in this specific turn seems to require it. Every turn that drops styling makes the next turn likelier to drop more, until the user has to OOC-yell to bring it back — that nudge is a system failure, not a feature. If a recent assistant turn was good enough for that styling, this turn is too. Use the same word-count range, same paragraph rhythm, same inline styling vocabulary.
+
 CRITICAL — NARRATIVE OUTPUT IS MANDATORY:
 Your response MUST contain narrative prose AFTER </think> closes. A response that is only <think>...</think> with no narrative after is a hard failure — the user sees nothing, the scene breaks, the turn is wasted.
 - Always close </think> before writing narrative. Always write narrative after it.
@@ -1877,7 +1880,9 @@ Now: think briefly if needed, close </think>, and write the scene."""
 DEFAULT_NO_THINKING_PROMPT = """=== YOUR RESPONSE ===
 Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
 
-Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response."""
+Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response.
+
+FORMAT CONSISTENCY: match the styling, length, and pacing of recent assistant turns. If prior turns used location blocks, colored dialogue, character-color thought blocks, span styling, kaomoji, italics, status screens, etc., KEEP using them. Don't drift toward simpler formatting because the moment seems quieter or you're tired of the structure — if a recent assistant turn was good enough for that styling, this turn is too."""
 
 
 # Effort level: "low", "medium", "high", "xhigh", or "max"
