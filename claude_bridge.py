@@ -433,7 +433,12 @@ def _load_image_desc_cache():
         if isinstance(data, dict):
             _IMAGE_DESC_CACHE = {str(k): str(v) for k, v in data.items() if v}
     except (OSError, json.JSONDecodeError) as e:
-        log(f"image desc cache read failed: {e}", "WARN")
+        # Use print here, not log() — this function runs at module-load
+        # time and log() isn't defined yet. Falling through silently with
+        # a stderr print preserves the cache-disabled fallback without
+        # crashing the import.
+        import sys as _sys
+        print(f"[startup] image desc cache read failed: {e}", file=_sys.stderr)
 
 
 def _save_image_desc_cache():
@@ -1840,7 +1845,7 @@ Required:
 - LOCATE every touch. Which side, where on that body part, how much pressure. "His hand on the inside of her right thigh, four inches above the knee, palm flat" not "his hand squeezes."
 - TRACK clothing precisely. What is bunched, lifted, undone, removed, slipped aside. Name what's now bare. "The nightgown bunched at her waist, her hips and stomach exposed, white cotton underwear still on" not "the fabric rode up."
 - TRACK positioning. Who's where, whose limbs are doing what, what is between their bodies. State it cleanly when it changes — don't let the reader lose track of the geometry.
-- NAME genitals and sexual anatomy directly when the scene is there: cock, clit, pussy, balls, nipples, ass. No clinical terms, no flowery euphemisms ("his sex", "her core", "her flower"). Plain words. Same register as the surrounding prose.
+- NAME genitals and sexual anatomy directly when the scene is there: cock, clit, pussy, balls, nipples, ass. No clinical terms, no flowery euphemisms ("his sex", "her core", "her flower"), AND no visual indirection ("the dark shadow between her thighs", "the seam where her hip meets her thigh", "where she was warm", "the slick heat of her"). Specific failure mode to watch for: models will name "cock" and "clit" fine but dodge "pussy" with a visual descriptor instead — you'll write everything else direct then go suddenly architectural about ONE body part. Stop that. If "cock" is fine, "pussy" is fine. Plain words, same register as the surrounding prose, every body part on equal footing.
 - WHEN penetration happens, say it. Don't fade to black inside metaphor. How deep, what angle, what rhythm — concretely.
 
 The character integrity rule still applies — characters stay in character, scenes go where they go. This isn't permission to write porn, it's permission to write physical scenes WITHOUT euphemistic distance. Realism beats coyness. If the scene wouldn't be unclear watching it, your prose shouldn't be unclear writing it.
