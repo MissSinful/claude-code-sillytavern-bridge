@@ -1391,6 +1391,7 @@
                     <button class="toggle-btn" data-memtab="npcs">NPCs</button>
                     <button class="toggle-btn" data-memtab="seed">Card Seed</button>
                     <button class="toggle-btn" data-memtab="errors">Errors</button>
+                    <button class="toggle-btn" data-memtab="import">Import</button>
                 </div>
 
                 <!-- Memories sub-panel -->
@@ -1462,6 +1463,84 @@
                 <div id="memSub_errors" class="memSubPanel" style="display:none;">
                     <p style="color:var(--paper-faint);font-size:12px;">Tail of <code>sonnet_errors.log</code> for this character. Empty means no recent maintenance failures.</p>
                     <pre id="memErrorsBody" style="background:var(--ink-sunk);padding:12px;border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;max-height:60vh;overflow:auto;"></pre>
+                </div>
+
+                <!-- Import sub-panel: bulk-import memories from external dumps.
+                     Vectors from external embedders (OpenAI / Cohere / etc.)
+                     don't transfer across embedding spaces, so we re-embed
+                     locally on ingest. Text is what's portable. -->
+                <div id="memSub_import" class="memSubPanel" style="display:none;">
+                    <p style="color:var(--paper-faint);font-size:12px;">
+                        Bulk-import memories from external dumps. Auto-detects JSONL / JSON / plain text / CSV / markdown.
+                        External embedding vectors are dropped (different embedding spaces aren't compatible);
+                        memory v2 re-embeds locally on insert.
+                    </p>
+
+                    <div style="display:grid;grid-template-columns:140px 1fr;gap:10px 14px;align-items:center;font-size:12px;margin-bottom:12px;">
+                        <label>Format</label>
+                        <select id="memImportFormat" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;width:200px;">
+                            <option value="auto" selected>auto-detect</option>
+                            <option value="jsonl">JSONL (one JSON object per line)</option>
+                            <option value="json">JSON (array or object)</option>
+                            <option value="text">plain text (paragraphs)</option>
+                            <option value="csv">CSV (with header)</option>
+                            <option value="markdown">markdown (## sections)</option>
+                        </select>
+
+                        <label>Default type</label>
+                        <select id="memImportDefaultType" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;width:200px;">
+                            <option value="fact" selected>fact</option>
+                            <option value="event">event</option>
+                            <option value="trait">trait</option>
+                            <option value="relationship">relationship</option>
+                            <option value="rule">rule</option>
+                            <option value="desire">desire</option>
+                            <option value="place">place</option>
+                            <option value="possession">possession</option>
+                            <option value="body">body</option>
+                            <option value="secret">secret</option>
+                        </select>
+
+                        <label>Default importance</label>
+                        <input id="memImportDefaultImportance" type="number" min="1" max="5" value="3" style="width:120px;padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;">
+
+                        <label>Scope</label>
+                        <select id="memImportNpcScope" style="padding:6px 10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;width:240px;">
+                            <option value="">main character DB</option>
+                        </select>
+
+                        <label>Upload file</label>
+                        <div>
+                            <input type="file" id="memImportFile" accept=".jsonl,.json,.txt,.csv,.md,.markdown" style="font-size:12px;">
+                            <span style="color:var(--paper-faint);font-size:11px;margin-left:8px;">— loads contents into the textarea below</span>
+                        </div>
+                    </div>
+
+                    <label style="display:block;font-size:11px;color:var(--paper-faint);text-transform:uppercase;letter-spacing:0.12em;margin-bottom:6px;">Memory dump</label>
+                    <textarea id="memImportText" rows="14" placeholder='Paste memory dump here, or upload a file above.
+
+Examples of accepted shapes:
+  JSONL:    {"text": "She prefers tea over coffee.", "subject": "user"}
+            {"text": "Met Reinhardt at Toccoa.", "type": "event"}
+  JSON:     [{"content": "..."}, {"content": "..."}]
+  Plain:    A paragraph here.
+
+            Another paragraph (blank line separates).
+  CSV:      content,subject,type
+            "...","user","fact"
+  Markdown: ## Section title
+            Section body becomes one memory.
+
+Common content fields auto-detected: content, text, memory, observation, page_content, message, body, summary.
+Common subject fields: subject, character, npc, entity, name.' style="width:100%;padding:10px;background:var(--ink-sunk);border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;resize:vertical;"></textarea>
+
+                    <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <button class="toggle-btn" id="memImportPreviewBtn">Preview</button>
+                        <button class="toggle-btn" id="memImportRunBtn" style="border-color:var(--accent,#7aa);color:var(--accent,#7aa);">Import</button>
+                        <span id="memImportStatus" style="color:var(--paper-faint);font-size:12px;font-family:var(--font-mono);"></span>
+                    </div>
+
+                    <pre id="memImportOutput" style="margin-top:12px;background:var(--ink-sunk);padding:12px;border:1px solid var(--rule);color:var(--paper);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;max-height:40vh;overflow:auto;display:none;"></pre>
                 </div>
             </div>
 
@@ -2325,6 +2404,138 @@
             }
         }
 
+        // ===== Memory Import sub-panel =====
+        // Loads file content into the textarea so the user can preview / edit
+        // before submitting. Plain-text read only — server-side parsing
+        // handles the actual format detection.
+        function memImportLoadFile(evt) {
+            const file = evt.target.files && evt.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                document.getElementById('memImportText').value = reader.result;
+                document.getElementById('memImportStatus').textContent =
+                    `Loaded ${file.name} (${reader.result.length} chars).`;
+                // Best-effort format hint from extension — user can still
+                // override via the dropdown.
+                const ext = file.name.toLowerCase().split('.').pop();
+                const fmtSel = document.getElementById('memImportFormat');
+                const guess = ({jsonl: 'jsonl', json: 'json', txt: 'text', csv: 'csv', md: 'markdown', markdown: 'markdown'})[ext];
+                if (guess && fmtSel.value === 'auto') fmtSel.value = guess;
+            };
+            reader.onerror = () => {
+                document.getElementById('memImportStatus').textContent = 'Error reading file.';
+            };
+            reader.readAsText(file);
+            // Reset so re-selecting the same file fires onchange again.
+            evt.target.value = '';
+        }
+
+        // Populate the NPC scope dropdown from memCurrentData.npcs. Called
+        // when the Import sub-tab is shown so the dropdown stays current
+        // with whatever character is loaded.
+        function memImportRefreshScope() {
+            const sel = document.getElementById('memImportNpcScope');
+            const prev = sel.value;
+            sel.innerHTML = '<option value="">main character DB</option>';
+            const npcs = (memCurrentData && memCurrentData.npcs) || [];
+            npcs.slice().sort((a, b) => {
+                const an = (a.name || a.npc_key || '').toLowerCase();
+                const bn = (b.name || b.npc_key || '').toLowerCase();
+                return an < bn ? -1 : an > bn ? 1 : 0;
+            }).forEach(npc => {
+                const opt = document.createElement('option');
+                opt.value = npc.npc_key;
+                const name = npc.name || npc.npc_key;
+                opt.textContent = name === npc.npc_key ? name : `${name} (${npc.npc_key})`;
+                sel.appendChild(opt);
+            });
+            if (prev) sel.value = prev;
+        }
+
+        // Run the import. dryRun=true returns parse preview; dryRun=false
+        // commits to the DB. Disables both buttons during the request so
+        // double-clicks don't double-insert.
+        async function memImportRun(dryRun) {
+            if (!memCurrentChar) {
+                alert('Pick a character first.');
+                return;
+            }
+            const text = document.getElementById('memImportText').value;
+            if (!text.trim()) {
+                alert('Paste or load some content first.');
+                return;
+            }
+            const fmt = document.getElementById('memImportFormat').value;
+            const defaultType = document.getElementById('memImportDefaultType').value;
+            const defaultImportance = parseInt(document.getElementById('memImportDefaultImportance').value, 10) || 3;
+            const npcKey = document.getElementById('memImportNpcScope').value;
+
+            const previewBtn = document.getElementById('memImportPreviewBtn');
+            const runBtn = document.getElementById('memImportRunBtn');
+            const status = document.getElementById('memImportStatus');
+            const out = document.getElementById('memImportOutput');
+            previewBtn.disabled = true;
+            runBtn.disabled = true;
+            status.textContent = dryRun ? 'Parsing...' : 'Importing...';
+
+            const url = `/api/memory/${encodeURIComponent(memCurrentChar)}/import` +
+                (npcKey ? `?npc=${encodeURIComponent(npcKey)}` : '');
+            try {
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        text,
+                        format: fmt,
+                        default_type: defaultType,
+                        default_importance: defaultImportance,
+                        dry_run: dryRun,
+                    }),
+                });
+                const data = await resp.json();
+                out.style.display = 'block';
+                if (!resp.ok) {
+                    status.textContent = `Error: ${resp.status}`;
+                    out.textContent = JSON.stringify(data, null, 2);
+                    return;
+                }
+                if (dryRun) {
+                    status.textContent =
+                        `Parsed ${data.count} entries (format: ${data.format}). ` +
+                        (data.count > 0 ? 'Review preview below, then click Import.' : '');
+                    out.textContent =
+                        `=== PREVIEW (first ${Math.min(5, data.count)} of ${data.count}) ===\n` +
+                        `format: ${data.format}\n\n` +
+                        (data.preview || []).map((p, i) =>
+                            `--- entry ${i + 1} ---\n` + JSON.stringify(p, null, 2)
+                        ).join('\n\n');
+                } else {
+                    status.textContent =
+                        `Imported ${data.imported} of ${data.imported + data.skipped} ` +
+                        `(format: ${data.format}, embeddings: ${data.embeddings_generated ? 'on' : 'off'}).`;
+                    out.textContent =
+                        `=== IMPORT RESULT ===\n` +
+                        `format:                ${data.format}\n` +
+                        `inserted:              ${data.imported}\n` +
+                        `skipped (errors):      ${data.skipped}\n` +
+                        `embeddings generated:  ${data.embeddings_generated}\n` +
+                        ((data.errors || []).length
+                            ? `\n--- errors (first ${data.errors.length}) ---\n` + data.errors.join('\n')
+                            : '');
+                    // Refresh the rows view so the user sees what landed.
+                    if (data.imported > 0) await memLoadChar(memCurrentChar);
+                }
+            } catch (e) {
+                status.textContent = 'Network error.';
+                out.style.display = 'block';
+                out.textContent = String(e);
+            } finally {
+                previewBtn.disabled = false;
+                runBtn.disabled = false;
+            }
+        }
+
         // Wire memory tab events
         document.addEventListener('DOMContentLoaded', () => {
             const sel = document.getElementById('memCharSelect');
@@ -2371,8 +2582,21 @@
                     btn.classList.add('active');
                     document.querySelectorAll('.memSubPanel').forEach(p => p.style.display = 'none');
                     document.getElementById('memSub_' + btn.dataset.memtab).style.display = 'block';
+                    // Tab-specific lazy refresh: import dropdown stays in
+                    // sync with whatever character / NPCs are currently
+                    // loaded. Errors tab refresh is already handled
+                    // elsewhere; needs/seed/npcs render from cached data.
+                    if (btn.dataset.memtab === 'import') memImportRefreshScope();
                 });
             });
+
+            // Wire memory import controls
+            const importFile = document.getElementById('memImportFile');
+            if (importFile) importFile.addEventListener('change', memImportLoadFile);
+            const importPreview = document.getElementById('memImportPreviewBtn');
+            if (importPreview) importPreview.addEventListener('click', () => memImportRun(true));
+            const importRun = document.getElementById('memImportRunBtn');
+            if (importRun) importRun.addEventListener('click', () => memImportRun(false));
         });
 
         // Sonnet produces thinking-only (or no) output at effort >= high.

@@ -4371,6 +4371,341 @@ def memory_errors(char_key):
         return jsonify({"error": str(e)}), 500
 
 
+# ---------------------------------------------------------------------------
+# Memory bulk-import — parses external memory dumps (RAG exports, plain text,
+# CSV, markdown, JSON) and ingests into memory v2. Vectors from external
+# embedders aren't portable across embedding spaces; we re-embed locally.
+# ---------------------------------------------------------------------------
+
+# Common content-bearing field names across RAG dumps. Order matters — first
+# match wins, so put the most semantically precise names first.
+_IMPORT_CONTENT_KEYS = ("content", "text", "memory", "observation", "page_content", "message", "body", "summary")
+_IMPORT_SUBJECT_KEYS = ("subject", "character", "npc", "entity", "name")
+_IMPORT_TYPE_KEYS = ("type", "memory_type", "category")
+
+
+def _import_normalize(obj, default_type: str, default_importance: int) -> dict:
+    """Map a parsed item (dict or string) to insert_memory kwargs.
+
+    Looks for content/subject/type at the top level first. If not found,
+    falls through to nested `metadata` (LangChain-style: {page_content,
+    metadata: {...}}) and the ST `vectors` extension format
+    ({id, metadata: {text, hash}, vector}). The metadata fallback is what
+    lets us ingest most real RAG dumps as-is.
+    """
+    if isinstance(obj, str):
+        return {"type": default_type, "content": obj.strip(), "importance": default_importance}
+    if not isinstance(obj, dict):
+        raise ValueError(f"expected dict or string, got {type(obj).__name__}")
+
+    # Build a search pool: top-level keys + (if present) keys nested in
+    # `metadata`. Top level wins on conflict so an explicit override always
+    # beats a nested default.
+    nested = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+
+    def _pick(keys):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if not isinstance(v, str) and v not in (None, "", [], {}):
+                return v
+        for k in keys:
+            v = nested.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if not isinstance(v, str) and v not in (None, "", [], {}):
+                return v
+        return None
+
+    content = _pick(_IMPORT_CONTENT_KEYS)
+    if content is None:
+        all_keys = list(obj.keys())[:6] + (
+            [f"metadata.{k}" for k in nested.keys()][:6] if nested else []
+        )
+        raise ValueError(
+            f"no content field; tried {_IMPORT_CONTENT_KEYS}; got keys: {all_keys}"
+        )
+    if not isinstance(content, str):
+        content = str(content)
+
+    item = {
+        "type": default_type,
+        "content": content.strip(),
+        "importance": default_importance,
+    }
+
+    # Pull a type if present and valid
+    type_val = _pick(_IMPORT_TYPE_KEYS)
+    if type_val:
+        t = str(type_val).strip().lower()
+        if t in memory_v2.MEMORY_TYPES:
+            item["type"] = t
+
+    # Subject (NPC key / "user" / "self")
+    subj_val = _pick(_IMPORT_SUBJECT_KEYS)
+    if subj_val:
+        item["subject"] = str(subj_val).strip()
+
+    # Direct passthrough of recognized fields (from top level only — nested
+    # metadata stays as the "metadata" passthrough below)
+    for k in ("intensity", "tags", "status"):
+        if k in obj and obj[k] is not None:
+            item[k] = obj[k]
+    # Preserve any user-supplied metadata blob (LangChain shape, ST vectors
+    # extension shape) into our metadata field. Callers can grep on
+    # provenance later (e.g. "this row came from ST vectors export").
+    if nested:
+        item["metadata"] = nested
+    elif obj.get("metadata") is not None:
+        item["metadata"] = obj["metadata"]
+    if "importance" in obj and obj["importance"] is not None:
+        try:
+            item["importance"] = int(obj["importance"])
+        except (TypeError, ValueError):
+            pass
+    return item
+
+
+def _import_parse_jsonl(text: str, default_type: str, default_importance: int) -> list[dict]:
+    items = []
+    for i, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSONL parse error on line {i}: {e}")
+        items.append(_import_normalize(obj, default_type, default_importance))
+    return items
+
+
+def _import_parse_json(text: str, default_type: str, default_importance: int) -> list[dict]:
+    obj = json.loads(text)
+    if isinstance(obj, list):
+        return [_import_normalize(it, default_type, default_importance) for it in obj]
+    if isinstance(obj, dict):
+        # Common wrapper shapes: {memories: [...]}, {data: [...]}, etc.
+        for key in ("memories", "items", "entries", "data", "records", "rows"):
+            inner = obj.get(key)
+            if isinstance(inner, list):
+                return [_import_normalize(it, default_type, default_importance) for it in inner]
+        # Single object — treat as one memory
+        return [_import_normalize(obj, default_type, default_importance)]
+    raise ValueError(f"expected JSON array or object, got {type(obj).__name__}")
+
+
+def _import_parse_text(text: str, default_type: str, default_importance: int) -> list[dict]:
+    """Plain text → one memory per non-empty paragraph (split on blank line)."""
+    items = []
+    for chunk in re.split(r"\n\s*\n", text):
+        chunk = chunk.strip()
+        if chunk:
+            items.append({"type": default_type, "content": chunk, "importance": default_importance})
+    return items
+
+
+def _import_parse_csv(text: str, default_type: str, default_importance: int) -> list[dict]:
+    import csv as _csv
+    import io as _io
+    reader = _csv.DictReader(_io.StringIO(text))
+    items = []
+    for i, row in enumerate(reader, 1):
+        # csv.DictReader gives strings; normalize empty-string keys to None
+        cleaned = {k: v for k, v in row.items() if k and v}
+        if not cleaned:
+            continue
+        try:
+            items.append(_import_normalize(cleaned, default_type, default_importance))
+        except ValueError as e:
+            raise ValueError(f"CSV row {i}: {e}")
+    return items
+
+
+def _import_parse_markdown(text: str, default_type: str, default_importance: int) -> list[dict]:
+    """Split on H2 headers (## ...). If no H2 headers, fall back to paragraph splitting.
+
+    H2 sections turn into one memory each, with the heading prepended to the
+    body so context isn't lost. Use H1 (#) as a doc-level title (skipped).
+    """
+    # Strip a leading H1 title if present
+    body = re.sub(r"\A#\s+[^\n]+\n+", "", text)
+    parts = re.split(r"^##\s+(.+)$", body, flags=re.MULTILINE)
+    # parts: [pre_first_h2, heading1, body1, heading2, body2, ...]
+    items = []
+    if len(parts) > 1:
+        # Discard pre_first_h2 (anything before the first ## header)
+        for i in range(1, len(parts), 2):
+            heading = parts[i].strip()
+            body_text = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            content = f"{heading}\n{body_text}".strip() if body_text else heading
+            if content:
+                items.append({"type": default_type, "content": content, "importance": default_importance})
+        return items
+    # No H2 sections — fall through to paragraph splitting
+    return _import_parse_text(text, default_type, default_importance)
+
+
+def _import_auto_detect(text: str) -> str:
+    """Best-effort format guess from first non-empty line + global shape."""
+    s = text.lstrip()
+    if not s:
+        return "text"
+    first_line = s.splitlines()[0].strip()
+    # Whole-file JSON (array or object) — must parse cleanly
+    if first_line.startswith(("[", "{")):
+        try:
+            json.loads(s)
+            return "json"
+        except json.JSONDecodeError:
+            pass
+    # JSONL — first line is a JSON object alone
+    if first_line.startswith("{"):
+        try:
+            json.loads(first_line)
+            return "jsonl"
+        except json.JSONDecodeError:
+            pass
+    # Markdown — H2 headers somewhere
+    if re.search(r"^##\s+", s, flags=re.MULTILINE):
+        return "markdown"
+    # CSV — first line looks like a header (commas, no leading punctuation)
+    if "," in first_line and not first_line.startswith(("#", "-", "*")):
+        # Require at least one comma-separated field name that's identifier-ish
+        head = [h.strip() for h in first_line.split(",")]
+        if any(re.match(r"^[A-Za-z_][\w ]*$", h) for h in head):
+            return "csv"
+    return "text"
+
+
+_IMPORT_PARSERS = {
+    "jsonl": _import_parse_jsonl,
+    "json": _import_parse_json,
+    "text": _import_parse_text,
+    "csv": _import_parse_csv,
+    "markdown": _import_parse_markdown,
+}
+
+
+@app.route("/api/memory/<char_key>/import", methods=["POST"])
+def memory_import(char_key):
+    """Bulk-import memories into the v2 store.
+
+    Body (JSON):
+      text:               the memory dump as a string (required)
+      format:             "auto" | "jsonl" | "json" | "text" | "csv" | "markdown"
+      default_type:       memory type for items without one (default "fact")
+      default_importance: 1-5 (default 3)
+      dry_run:            bool — if true, parse + return preview but don't insert
+
+    Query params:
+      ?npc=<key>          scope insert into the NPC sub-DB instead of the
+                          character's main DB
+
+    Returns:
+      dry_run=true:  {format, count, preview}
+      dry_run=false: {format, imported, skipped, errors}
+    """
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "text is required and must be non-empty"}), 400
+
+    fmt = (data.get("format") or "auto").strip().lower()
+    default_type = (data.get("default_type") or "fact").strip().lower()
+    if default_type not in memory_v2.MEMORY_TYPES:
+        return jsonify({
+            "error": f"default_type must be one of {list(memory_v2.MEMORY_TYPES)}"
+        }), 400
+    try:
+        default_importance = int(data.get("default_importance", 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "default_importance must be an integer 1-5"}), 400
+    default_importance = max(1, min(5, default_importance))
+    dry_run = bool(data.get("dry_run", False))
+
+    if fmt == "auto":
+        fmt = _import_auto_detect(text)
+
+    parser = _IMPORT_PARSERS.get(fmt)
+    if not parser:
+        return jsonify({
+            "error": f"unknown format {fmt!r}; expected one of {list(_IMPORT_PARSERS)} or 'auto'"
+        }), 400
+
+    try:
+        items = parser(text, default_type, default_importance)
+    except ValueError as e:
+        return jsonify({"error": f"{fmt} parse error: {e}"}), 400
+    except json.JSONDecodeError as e:
+        return jsonify({"error": f"JSON parse error: {e}"}), 400
+    except Exception as e:
+        log(f"memory_import unexpected parser error ({fmt}): {e}", "ERROR")
+        return jsonify({"error": f"parser failure: {e}"}), 500
+
+    if not items:
+        return jsonify({
+            "format": fmt,
+            "count": 0,
+            "imported": 0,
+            "errors": ["no parseable entries found in the input"],
+        })
+
+    if dry_run:
+        # Preview clamps content for readability — full text comes through on
+        # the actual import.
+        preview = []
+        for it in items[:5]:
+            row = {k: v for k, v in it.items() if k != "embedding"}
+            if isinstance(row.get("content"), str) and len(row["content"]) > 240:
+                row["content"] = row["content"][:240] + "…"
+            preview.append(row)
+        return jsonify({"format": fmt, "count": len(items), "preview": preview})
+
+    # Live insert. Open the right connection (NPC sub-DB if requested).
+    npc_key = (request.args.get("npc") or "").strip() or None
+    conn = (
+        memory_v2.get_connection(char_key, npc_key=npc_key)
+        if npc_key else memory_v2.get_connection(char_key)
+    )
+    if conn is None:
+        return jsonify({"error": "no DB for this character/NPC — bootstrap it first"}), 404
+
+    current_turn = memory_v2.latest_turn(conn)
+    embedder_ready = memory_v2.embeddings_available()
+
+    inserted = 0
+    errors: list[str] = []
+    with memory_v2.transaction(conn):
+        for i, item in enumerate(items, 1):
+            try:
+                if "embedding" not in item and embedder_ready:
+                    emb = memory_v2.embed(str(item["content"]))
+                    if emb:
+                        item["embedding"] = emb
+                item.setdefault("created_turn", current_turn)
+                memory_v2.insert_memory(conn, **item)
+                inserted += 1
+            except (ValueError, TypeError) as e:
+                errors.append(f"item {i}: {e}")
+            except Exception as e:
+                errors.append(f"item {i}: unexpected error: {e}")
+
+    log(
+        f"memory_import [{char_key}{'/'+npc_key if npc_key else ''}] "
+        f"format={fmt} parsed={len(items)} inserted={inserted} errors={len(errors)}",
+        "SUCCESS" if inserted else "WARN",
+    )
+    return jsonify({
+        "format": fmt,
+        "imported": inserted,
+        "skipped": len(items) - inserted,
+        "errors": errors[:20],  # cap to keep payload sane
+        "embeddings_generated": embedder_ready,
+    })
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint."""
