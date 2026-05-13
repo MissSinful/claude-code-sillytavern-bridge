@@ -28,7 +28,7 @@ from flask_cors import CORS
 # they're behind. Keeping it in the source file (rather than deriving
 # from git) means it Just Works for users who download a zip instead of
 # cloning — no git metadata required at runtime.
-__version__ = "1.2.9"
+__version__ = "1.3.0"
 
 # =============================================================================
 # CLAUDE CLI RESOLUTION
@@ -433,7 +433,12 @@ def _load_image_desc_cache():
         if isinstance(data, dict):
             _IMAGE_DESC_CACHE = {str(k): str(v) for k, v in data.items() if v}
     except (OSError, json.JSONDecodeError) as e:
-        log(f"image desc cache read failed: {e}", "WARN")
+        # Use print here, not log() — this function runs at module-load
+        # time and log() isn't defined yet. Falling through silently with
+        # a stderr print preserves the cache-disabled fallback without
+        # crashing the import.
+        import sys as _sys
+        print(f"[startup] image desc cache read failed: {e}", file=_sys.stderr)
 
 
 def _save_image_desc_cache():
@@ -754,14 +759,14 @@ def summarize_new_messages(new_messages):
         return ""
 
     prompt = load_prompt("summarize_incremental", msg_text=msg_text)
-    result = call_claude_code([{"role": "user", "content": prompt}])
+    result = call_claude_code([{"role": "user", "content": prompt}], skip_memory=True)
     return result.get("response", "").strip()
 
 
 def condense_summary(long_summary):
     """Condense a summary that's gotten too long."""
     prompt = load_prompt("condense", long_summary=long_summary)
-    result = call_claude_code([{"role": "user", "content": prompt}])
+    result = call_claude_code([{"role": "user", "content": prompt}], skip_memory=True)
     return result.get("response", "").strip()
 
 
@@ -1840,7 +1845,7 @@ Required:
 - LOCATE every touch. Which side, where on that body part, how much pressure. "His hand on the inside of her right thigh, four inches above the knee, palm flat" not "his hand squeezes."
 - TRACK clothing precisely. What is bunched, lifted, undone, removed, slipped aside. Name what's now bare. "The nightgown bunched at her waist, her hips and stomach exposed, white cotton underwear still on" not "the fabric rode up."
 - TRACK positioning. Who's where, whose limbs are doing what, what is between their bodies. State it cleanly when it changes — don't let the reader lose track of the geometry.
-- NAME genitals and sexual anatomy directly when the scene is there: cock, clit, pussy, balls, nipples, ass. No clinical terms, no flowery euphemisms ("his sex", "her core", "her flower"). Plain words. Same register as the surrounding prose.
+- NAME genitals and sexual anatomy directly when the scene is there: cock, clit, pussy, balls, nipples, ass. No clinical terms, no flowery euphemisms ("his sex", "her core", "her flower"), AND no visual indirection ("the dark shadow between her thighs", "the seam where her hip meets her thigh", "where she was warm", "the slick heat of her"). Specific failure mode to watch for: models will name "cock" and "clit" fine but dodge "pussy" with a visual descriptor instead — you'll write everything else direct then go suddenly architectural about ONE body part. Stop that. If "cock" is fine, "pussy" is fine. Plain words, same register as the surrounding prose, every body part on equal footing.
 - WHEN penetration happens, say it. Don't fade to black inside metaphor. How deep, what angle, what rhythm — concretely.
 
 The character integrity rule still applies — characters stay in character, scenes go where they go. This isn't permission to write porn, it's permission to write physical scenes WITHOUT euphemistic distance. Realism beats coyness. If the scene wouldn't be unclear watching it, your prose shouldn't be unclear writing it.
@@ -1862,6 +1867,9 @@ Follow the system prompt above precisely. Characters stay in character - if they
 PLANNING + RESPONSE FORMAT:
 You may plan briefly inside a <think>...</think> block before writing the narrative. Keep planning short — a paragraph or two of free-form notes is plenty. No structured sections, no per-character templates, no exhaustive analysis: the heavy character/world tracking is already handled out-of-band and injected for you. Just orient yourself, decide the beat, then write.
 
+FORMAT CONSISTENCY — read this, it's a frequent failure:
+Match the styling, length, and pacing of recent assistant turns. If prior turns used location blocks, colored dialogue, character-color thought blocks, span styling, kaomoji, italics, status screens, or any other formatting, KEEP using them. Don't drift toward simpler formatting because the moment seems quieter, because you're tired of the structure, or because nothing in this specific turn seems to require it. Every turn that drops styling makes the next turn likelier to drop more, until the user has to OOC-yell to bring it back — that nudge is a system failure, not a feature. If a recent assistant turn was good enough for that styling, this turn is too. Use the same word-count range, same paragraph rhythm, same inline styling vocabulary.
+
 CRITICAL — NARRATIVE OUTPUT IS MANDATORY:
 Your response MUST contain narrative prose AFTER </think> closes. A response that is only <think>...</think> with no narrative after is a hard failure — the user sees nothing, the scene breaks, the turn is wasted.
 - Always close </think> before writing narrative. Always write narrative after it.
@@ -1877,7 +1885,9 @@ Now: think briefly if needed, close </think>, and write the scene."""
 DEFAULT_NO_THINKING_PROMPT = """=== YOUR RESPONSE ===
 Follow the system prompt above precisely. Characters stay in character - if they're meant to be harsh, forceful, or antagonistic, WRITE THEM THAT WAY. Do not soften, hesitate, or add out-of-character kindness. Let the narrative unfold authentically.
 
-Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response."""
+Respond directly with the narrative. Do NOT use <think> tags or write planning notes — your entire output should be the in-character narrative response.
+
+FORMAT CONSISTENCY: match the styling, length, and pacing of recent assistant turns. If prior turns used location blocks, colored dialogue, character-color thought blocks, span styling, kaomoji, italics, status screens, etc., KEEP using them. Don't drift toward simpler formatting because the moment seems quieter or you're tired of the structure — if a recent assistant turn was good enough for that styling, this turn is too."""
 
 
 # Effort level: "low", "medium", "high", "xhigh", or "max"
@@ -2316,18 +2326,14 @@ def _msg_text(m: dict) -> str:
     return str(content) if content is not None else ""
 
 
-def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
-    """Hash the first `prefix_count` user/assistant messages by content.
-
-    Skips system messages because ST inserts/removes lorebook system
-    entries between turns, which would invalidate the cache spuriously
-    every turn for any user with World Info active. User+assistant content
-    only changes when the user explicitly edits the chat — that's the
-    signal we actually want to catch.
-
-    First 200 chars per message are enough; an edit virtually always
-    changes something near the start. Keeps the hash work cheap.
-    """
+def _per_msg_prefix_sigs(messages: list, prefix_count: int) -> list:
+    """Build the per-message signatures used by both the prefix hash and the
+    diagnostic. Returns a list of `<role-initial>:<first-200-chars>` strings,
+    one per user/assistant message up to prefix_count. Pass a very large
+    prefix_count (e.g. 10**9) to get all user/asst sigs in the messages list.
+    System messages are skipped because ST churns them every turn (lorebook
+    entries, persona notes etc.) and that churn is benign — only
+    user/assistant content edits should invalidate the session."""
     sigs = []
     count = 0
     for m in messages:
@@ -2337,14 +2343,47 @@ def _hash_user_asst_prefix(messages: list, prefix_count: int) -> str:
             break
         sigs.append(f"{m['role'][0]}:{_msg_text(m)[:200]}")
         count += 1
-    if not sigs:
-        return ""
-    return hashlib.md5("|".join(sigs).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return sigs
 
 
 def _count_user_asst(messages: list) -> int:
     """Count user+assistant messages, skipping system entries."""
     return sum(1 for m in messages if m.get("role") in ("user", "assistant"))
+
+
+# Preset-injection patterns to ignore when identifying the user's actual
+# reply for swipe detection. ST presets (Celia, Storyteller, etc.) wrap
+# every turn with marker messages and a fixed-content "author instruction"
+# block — those appear at the same positions every turn and are byte-
+# identical between turns. Without this filter, the swipe check picks up
+# the constant instruction block as the "latest user msg" and falsely
+# concludes every turn is a replay.
+_ST_INJECTION_PREFIXES = ("<turn>", "<latest_turn", "[ooc", "(ooc")
+_ST_INJECTION_SUBSTRINGS = ("vital that author", "past events:", "story summary:")
+
+
+def _sig_is_st_injection(sig: str) -> bool:
+    """True if this signature looks like an ST preset injection rather than
+    the user's actual chat reply. Mirrors the equivalent logic in
+    memory_v2.find_npcs_in_scene's injection skip."""
+    if not sig or len(sig) < 2:
+        return False
+    content = sig[2:]  # strip "u:" / "a:" role prefix
+    low = content.lower().strip()
+    if any(low.startswith(p) for p in _ST_INJECTION_PREFIXES):
+        return True
+    if any(s in low for s in _ST_INJECTION_SUBSTRINGS):
+        return True
+    return False
+
+
+def _last_real_user_sig(sigs: list):
+    """Find the last user-role signature that ISN'T a preset injection.
+    Returns None if no real user msg found."""
+    for sig in reversed(sigs):
+        if sig.startswith("u:") and not _sig_is_st_injection(sig):
+            return sig
+    return None
 
 
 def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
@@ -2378,56 +2417,123 @@ def _decide_resume(messages: list, char_key_override: str = None) -> tuple:
         session_id = entry.get("session_id")
         last_count = entry.get("last_message_count", 0)
         last_user_count = entry.get("last_user_count")
-        last_user_asst_count = entry.get("last_user_asst_count")
-        last_prefix_hash = entry.get("last_prefix_hash")
 
     if not session_id:
         return (char_key, None, "missing session_id")
 
     new_count = len(messages)
     delta = new_count - last_count
-    # Why: ST appends user (+1) or user+assistant (+2) between turns.
-    # Anything else means swipe (same count, content replaced), edit, or
-    # a rebuilt context — cache no longer valid.
-    if delta not in (1, 2):
+
+    # Bound the cached session's lifespan. The CLI's --resume keeps
+    # appending to the cached context; without a refresh, the model's
+    # cached view grows monotonically and contains the original raw
+    # history of every prior turn — which defeats auto-summary entirely
+    # (the bridge's prompt becomes summary+recent but the model's cache
+    # still has the originals). After SESSION_GROWTH_LIMIT messages of
+    # growth since the session was first established, force a fresh
+    # session — the next call will use the rebuilt summary+recent prompt
+    # and the cache will be sized down to that.
+    SESSION_GROWTH_LIMIT = 50
+    msgs_at_session_start = entry.get("messages_at_session_start", last_count)
+    session_growth = last_count - msgs_at_session_start
+    if session_growth >= SESSION_GROWTH_LIMIT:
         with _SESSION_LOCK:
             SESSION_MAP.pop(char_key, None)
             _save_sessions()
-        return (char_key, None, f"message delta {delta} invalidates session")
+        return (char_key, None,
+                f"session age limit reached ({session_growth} msgs since establish, "
+                f"limit {SESSION_GROWTH_LIMIT}); refreshing for cache hygiene")
 
-    # Disambiguate swipe vs accept inside delta==1/2. ST sends the swiped
-    # assistant response back as part of history when the user clicks swipe,
-    # so total delta=+1 with NO new user message is the swipe shape — and
-    # resuming there causes the CLI to act like a "continue" button instead
-    # of regenerating the turn. Compare the user-message count: if it didn't
-    # advance, this is a swipe regardless of total delta.
-    if last_user_count is not None:
-        new_user_count = _count_user_msgs(messages)
-        user_delta = new_user_count - last_user_count
-        if user_delta <= 0:
-            with _SESSION_LOCK:
-                SESSION_MAP.pop(char_key, None)
-                _save_sessions()
-            return (char_key, None, f"swipe detected (user_delta={user_delta}, total_delta={delta})")
-
-    # Detect prefix edits: if the user changed an earlier message's content
-    # (without changing message counts), the CLI session's cached prefix is
-    # stale and must be invalidated — otherwise the model never sees the
-    # edit because --resume only sends the latest user message.
+    # Discriminate swipe / replay vs real follow-up by comparing the
+    # LATEST user message in the new request against the latest user
+    # message at session capture:
     #
-    # We hash the user+assistant content of the previous prefix on session
-    # capture, then on the next request hash the SAME prefix length from
-    # the new messages. If the hashes differ, something in the prefix was
-    # edited → invalidate. System messages are excluded from the hash so
-    # ST's lorebook entries (which churn every turn as keywords shift)
-    # don't trigger spurious invalidation.
-    if last_user_asst_count and last_prefix_hash:
-        new_prefix_hash = _hash_user_asst_prefix(messages, last_user_asst_count)
-        if new_prefix_hash and new_prefix_hash != last_prefix_hash:
+    #   - SAME content → ST is replaying the user msg unchanged (swipe).
+    #     Invalidate so the next call doesn't piggyback on the cached
+    #     response.
+    #
+    #   - DIFFERENT content → genuine follow-up. Continue to the
+    #     recent-tail check.
+    #
+    # Only the LATEST stored user sig is compared, not all stored sigs.
+    # Comparing against all stored sigs false-positives on common short
+    # messages ("ok", "yes", "continue") that the user has typed before
+    # — any prior occurrence in stored would falsely look like a swipe.
+    # A real swipe specifically replays the immediately-prior user msg.
+    stored_per_msg = entry.get("last_prefix_per_msg") or []
+    new_full_sigs = _per_msg_prefix_sigs(messages, prefix_count=10**9)
+    # Use the last REAL user msg (skipping ST preset injections like
+    # <latest_turn_end> markers and "Vital that author" instruction
+    # blocks). Without this skip, the constant injection block at the
+    # tail looks identical between turns and trips swipe detection on
+    # every real reply.
+    last_new_user_sig = _last_real_user_sig(new_full_sigs)
+    last_stored_user_sig = _last_real_user_sig(stored_per_msg)
+    if (last_stored_user_sig is not None
+            and last_new_user_sig is not None
+            and last_new_user_sig == last_stored_user_sig):
+        # Diagnostic: surface what the last user sig looks like in both
+        # the stored snapshot and the new request, plus where the new last
+        # user msg sits in the message list. False positives here usually
+        # mean either ST is appending something after the user's actual
+        # reply (so "find last user" returns an earlier msg) or signature
+        # truncation (200 chars) is making two distinct messages collide.
+        try:
+            new_user_pos = -1
+            for idx in range(len(messages) - 1, -1, -1):
+                if messages[idx].get("role") == "user":
+                    new_user_pos = idx
+                    break
+            new_total = len(messages)
+            log(
+                f"swipe diagnostic: last_user matched stored. "
+                f"new last-user is at position {new_user_pos} of {new_total} "
+                f"(distance from end: {new_total - 1 - new_user_pos if new_user_pos >= 0 else '?'})",
+                "INFO",
+            )
+            log(f"  stored last-user sig: {last_stored_user_sig[:200]!r}", "INFO")
+            log(f"  new    last-user sig: {last_new_user_sig[:200]!r}", "INFO")
+            # Show the next few stored sigs after the last-user too — if
+            # there were assistant msgs after the captured user msg (the
+            # response we cached), they'd be there.
+            stored_tail = stored_per_msg[-5:]
+            log(f"  stored tail (last 5 sigs): {[s[:60] for s in stored_tail]}", "INFO")
+            # And the same for the new tail.
+            new_tail = new_full_sigs[-5:]
+            log(f"  new    tail (last 5 sigs): {[s[:60] for s in new_tail]}", "INFO")
+        except Exception as e:
+            log(f"swipe diagnostic failed: {e}", "WARN")
+        with _SESSION_LOCK:
+            SESSION_MAP.pop(char_key, None)
+            _save_sessions()
+        return (char_key, None,
+                "swipe/replay detected (latest user msg unchanged from capture)")
+
+    # Validate the RECENT tail of stored sigs is still in the new request.
+    # If the user edited a recent message, its old sig won't be in new and
+    # we invalidate. If old (ancient-history) messages got dropped or
+    # ST shifted things mid-history, the recent tail is unaffected and
+    # we resume — that's the right call since --resume only sends the
+    # latest user msg and the cache's continuity from recent context is
+    # what matters.
+    RECENT_VALIDATION_COUNT = 5
+    if stored_per_msg:
+        recent_to_check = stored_per_msg[-RECENT_VALIDATION_COUNT:]
+        new_sig_set = set(new_full_sigs)
+        missing = [s for s in recent_to_check if s not in new_sig_set]
+        if missing:
+            log(
+                f"recent-context check: {len(missing)} of {len(recent_to_check)} "
+                f"recent captured msg(s) not present in new request — "
+                f"likely an edit to a recent message. Invalidating.",
+                "INFO",
+            )
+            for s in missing[:3]:
+                log(f"  missing from new: {s[:120]!r}", "INFO")
             with _SESSION_LOCK:
                 SESSION_MAP.pop(char_key, None)
                 _save_sessions()
-            return (char_key, None, "prefix edit detected (content hash changed)")
+            return (char_key, None, "recent message edit detected")
 
     # Historically we also hashed system messages to invalidate when the
     # system prompt / preset / character card changed. That hash fired
@@ -2448,14 +2554,32 @@ def _update_session(char_key: str, session_id: str, messages: list):
     new_count = len(messages)
     new_user_count = _count_user_msgs(messages)
     new_user_asst_count = _count_user_asst(messages)
-    new_prefix_hash = _hash_user_asst_prefix(messages, new_user_asst_count)
+    # Only store the recent tail used by the resume check. Storing the
+    # full prefix turned out wrong: ST drops summarized-away messages
+    # from the request and the bridge would then invalidate every turn
+    # because old stored sigs weren't in the new request — but those
+    # old messages don't affect --resume anyway. Tail of 30 covers the
+    # default 5-msg recent-validation window with comfortable margin.
+    new_recent = _per_msg_prefix_sigs(messages, prefix_count=10**9)[-30:]
     with _SESSION_LOCK:
+        existing = SESSION_MAP.get(char_key, {})
+        # Track when the current session_id was first established. Same
+        # session_id (we're updating after a successful --resume) → keep
+        # the original start count. New session_id (CLI established a
+        # fresh session) → reset to current count. The resume decision
+        # uses this to bound session age so the cached context doesn't
+        # grow unbounded across many resumed turns.
+        if existing.get("session_id") == session_id:
+            messages_at_session_start = existing.get("messages_at_session_start", new_count)
+        else:
+            messages_at_session_start = new_count
         SESSION_MAP[char_key] = {
             "session_id": session_id,
             "last_message_count": new_count,
             "last_user_count": new_user_count,
             "last_user_asst_count": new_user_asst_count,
-            "last_prefix_hash": new_prefix_hash,
+            "last_prefix_per_msg": new_recent,
+            "messages_at_session_start": messages_at_session_start,
             "updated_at": time.time(),
         }
         _save_sessions()
@@ -2464,7 +2588,7 @@ def _update_session(char_key: str, session_id: str, messages: list):
 _load_sessions()
 
 
-def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None) -> dict:
+def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None, skip_memory: bool = False, tracking_messages: list = None) -> dict:
     """
     Call Claude Code CLI with the given messages.
     Converts OpenAI message format to a prompt for Claude.
@@ -2551,7 +2675,13 @@ def call_claude_code(messages: list, tools: list = None, process_holder: dict = 
                 if "data:image" in content and runtime_settings.get("debug_output"):
                     log(f"  Found base64 image data in string content at index {idx}")
                 content, img_paths = extract_and_save_images(content)
-                all_image_paths.extend(img_paths)
+                # extract_and_save_images returns (filepath, hash) tuples;
+                # all_image_paths is consumed downstream as a list of plain
+                # path strings (get_or_describe_image, the SCENE IMAGES
+                # block, etc.), so unpack here. Keeping tuples in caused
+                # describe_image() to fail with `'tuple' object has no
+                # attribute 'lower'` when it tried image_path.lower().
+                all_image_paths.extend(t[0] for t in img_paths)
             else:
                 # For older messages, just clean out any base64 data but don't process
                 # Replace old [IMAGE: path] markers with a note
@@ -2731,7 +2861,15 @@ Use the Read tool to view each, then weave the visual details into your scene wi
     # no extra tools or permission-mode flags are required.
     memory_v2_active = False
     memory_v2_char_key = None
-    if runtime_settings.get("character_memory_v2_enabled", False):
+    # skip_memory short-circuits the memory v2 pipeline. Set by utility
+    # callers (chunking summary, condense, lorebook generation, etc.)
+    # where we're using call_claude_code as a generic Sonnet/Opus wrapper
+    # and not for an actual roleplay turn. Without this guard, every
+    # utility call ran prepare_turn, fired Sonnet ranking + semantic
+    # search on the utility prompt, injected character memory into the
+    # summarization context, and then staged the utility response as if
+    # it were the character's narrative — contaminating the memory DB.
+    if not skip_memory and runtime_settings.get("character_memory_v2_enabled", False):
         # Pinned key takes precedence over message-fingerprint derivation.
         # When the user has pinned a char_key from the Memory tab, we use
         # that exact value for both memory ops AND CLI session reuse — so
@@ -2793,11 +2931,21 @@ Use the Read tool to view each, then weave the visual details into your scene wi
     # system-prompt-file, relying on the CLI's own cached session state.
     # Gated on cli_session_reuse so users who see unexpected behavior can
     # opt out from the GUI without a code change.
+    #
+    # Resume + staging continuity decisions (here, _update_session below,
+    # memory_v2.stage_turn) all use `tracking_messages` — the ORIGINAL
+    # pre-rebuild message list. The model still sees `messages` (which may
+    # have been rebuilt by auto-summary), but tracking against the rebuilt
+    # list produces fixed-shape counts (system + summary + last 15) that
+    # confuse the delta + user-count heuristics. Tracking against the
+    # original messages keeps continuity stable across auto-summary cycles
+    # and across summary-threshold updates.
+    track = tracking_messages if tracking_messages is not None else messages
     resume_char_key = None
     resume_session_id = None
     resume_reason = "disabled by setting"
     if runtime_settings.get("cli_session_reuse", True):
-        resume_char_key, resume_session_id, resume_reason = _decide_resume(messages, char_key_override=char_key)
+        resume_char_key, resume_session_id, resume_reason = _decide_resume(track, char_key_override=char_key)
         if resume_session_id:
             if runtime_settings.get("debug_output"):
                 log(f"Resuming CLI session for [{resume_char_key}] ({resume_session_id[:8]}...): {resume_reason}", "INFO")
@@ -3149,8 +3297,12 @@ Use the Read tool to view each, then weave the visual details into your scene wi
                 # original pre-rebuild messages). Fall back to the resume
                 # decision's key (also override-aware), and only as a last
                 # resort compute from the possibly-rebuilt messages here.
-                persist_key = char_key or resume_char_key or get_character_key(messages)
-                _update_session(persist_key, captured_session_id, messages)
+                persist_key = char_key or resume_char_key or get_character_key(track)
+                # Persist counts against the ORIGINAL message list so the
+                # delta check on the next turn is comparing apples to apples.
+                # Without this, auto-summary's fixed-shape rebuild produces
+                # delta=0 every turn → invalidates the session forever.
+                _update_session(persist_key, captured_session_id, track)
             except Exception as e:
                 log(f"Could not persist CLI session: {e}", "WARN")
 
@@ -3177,11 +3329,18 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         # on the *next* request once we can confirm the user accepted it
         # (their next prompt will include this response in messages history).
         # Swipe/regen → buffer is discarded and replaced. See stage_turn().
+        #
+        # Pass `track` (the original pre-rebuild messages), not `messages`.
+        # The swipe-vs-accept detection in _flush_pending_if_accepted compares
+        # user-message counts between stage and the next request; using the
+        # rebuilt list here would compare against a fixed-shape window that
+        # doesn't reliably grow on accept, so accepts get mis-classified as
+        # swipes (or vice versa).
         if memory_v2_active and memory_v2_char_key and clean_response and clean_response.strip():
             try:
                 memory_v2.stage_turn(
                     char_key=memory_v2_char_key,
-                    messages=messages,
+                    messages=track,
                     assistant_response=clean_response,
                     char_name=memory_v2_char_key,
                 )
@@ -3440,6 +3599,16 @@ def chat_completions():
         except Exception:
             original_char_key = None
 
+        # Snapshot the ORIGINAL message list before any auto-summary or
+        # chunking rebuild. This gets passed to call_claude_code as
+        # `tracking_messages` so the CLI session-reuse decision and memory
+        # v2 staging compare turn-over-turn against the real conversation
+        # length, not the fixed-shape window auto-summary produces. Without
+        # this, every turn under auto-summary saw delta=0 and the session
+        # invalidated forever; memory v2 swipe detection mis-classified
+        # accepts and swipes interchangeably.
+        original_messages = list(messages)
+
         # Auto-summary mode - incremental summarization
         if runtime_settings.get("auto_summary_enabled", False) and not runtime_settings.get("chunking_enabled", False):
             use_summary, summary_text, recent_messages = process_auto_summary(messages)
@@ -3547,17 +3716,36 @@ The above summarizes the story so far. Continue from the recent messages below."
                         chunk_chars = sum(len(m.get("content", "")) for m in chunk)
                         log(f"  Chunk {i+1}: {len(chunk)} messages, {chunk_chars:,} chars")
 
-                    # Process each chunk for summary
+                    # Process each chunk for summary. Old images from earlier
+                    # turns aren't relevant to the chunk summary — they were
+                    # already factored into the assistant responses being
+                    # summarized — and passing them through call_claude_code
+                    # would trigger the image describer pre-pass on multi-
+                    # megabyte payloads. Strip embedded base64 from chunk_text
+                    # AFTER the f-string concatenation, because multipart
+                    # messages have list-typed content (with image_url parts)
+                    # that gets stringified by f-string into something like
+                    # `[{'type':'image_url','image_url':{'url':'data:image/...'}}]`
+                    # and the base64 leaks through if we only strip strings.
                     chunk_results = []
+                    base64_image_pattern = re.compile(
+                        r'data:image/(?:png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+',
+                        re.IGNORECASE,
+                    )
                     for i, chunk in enumerate(chunks, 1):
                         log(f"Processing chunk {i}/{len(chunks)}...")
 
-                        # Format chunk as text
+                        # Format chunk as text, then strip any base64 (handles
+                        # both string-content and stringified-list-content cases).
                         chunk_text = ""
                         for msg in chunk:
                             role = msg.get("role", "user").upper()
                             content = msg.get("content", "")
                             chunk_text += f"[{role}]: {content}\n\n"
+                        before_len = len(chunk_text)
+                        chunk_text = base64_image_pattern.sub("[image]", chunk_text)
+                        if len(chunk_text) != before_len:
+                            log(f"  Stripped embedded base64 image data from chunk {i} ({before_len - len(chunk_text):,} chars)")
 
                         prompt = load_prompt(
                             "summarize_chunk",
@@ -3566,7 +3754,7 @@ The above summarizes the story so far. Continue from the recent messages below."
                             chunk_text=chunk_text,
                         )
 
-                        result = call_claude_code([{"role": "user", "content": prompt}])
+                        result = call_claude_code([{"role": "user", "content": prompt}], skip_memory=True)
                         chunk_results.append(result.get("response", ""))
                         log(f"Chunk {i} done: {len(chunk_results[-1])} chars")
 
@@ -3608,7 +3796,7 @@ Now, based on this context, please respond to the following request:
 {last_user_msg}"""
 
                 log("Sending final request with context...")
-                final_result = call_claude_code([{"role": "user", "content": final_prompt}])
+                final_result = call_claude_code([{"role": "user", "content": final_prompt}], skip_memory=True)
                 response_text = final_result.get("response", "")
 
                 # Consolidate multiple think blocks into one (ST only supports one)
@@ -3675,7 +3863,8 @@ Now, based on this context, please respond to the following request:
         def worker():
             try:
                 result_holder["result"] = call_claude_code(
-                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key, json_schema=json_schema
+                    messages, tools=tools, process_holder=process_holder, char_key=original_char_key, json_schema=json_schema,
+                    tracking_messages=original_messages,
                 )
             except Exception as e:
                 log(f"Worker crashed: {e}", "ERROR")
@@ -4180,6 +4369,341 @@ def memory_errors(char_key):
         return jsonify({"text": text})
     except OSError as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Memory bulk-import — parses external memory dumps (RAG exports, plain text,
+# CSV, markdown, JSON) and ingests into memory v2. Vectors from external
+# embedders aren't portable across embedding spaces; we re-embed locally.
+# ---------------------------------------------------------------------------
+
+# Common content-bearing field names across RAG dumps. Order matters — first
+# match wins, so put the most semantically precise names first.
+_IMPORT_CONTENT_KEYS = ("content", "text", "memory", "observation", "page_content", "message", "body", "summary")
+_IMPORT_SUBJECT_KEYS = ("subject", "character", "npc", "entity", "name")
+_IMPORT_TYPE_KEYS = ("type", "memory_type", "category")
+
+
+def _import_normalize(obj, default_type: str, default_importance: int) -> dict:
+    """Map a parsed item (dict or string) to insert_memory kwargs.
+
+    Looks for content/subject/type at the top level first. If not found,
+    falls through to nested `metadata` (LangChain-style: {page_content,
+    metadata: {...}}) and the ST `vectors` extension format
+    ({id, metadata: {text, hash}, vector}). The metadata fallback is what
+    lets us ingest most real RAG dumps as-is.
+    """
+    if isinstance(obj, str):
+        return {"type": default_type, "content": obj.strip(), "importance": default_importance}
+    if not isinstance(obj, dict):
+        raise ValueError(f"expected dict or string, got {type(obj).__name__}")
+
+    # Build a search pool: top-level keys + (if present) keys nested in
+    # `metadata`. Top level wins on conflict so an explicit override always
+    # beats a nested default.
+    nested = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+
+    def _pick(keys):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if not isinstance(v, str) and v not in (None, "", [], {}):
+                return v
+        for k in keys:
+            v = nested.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if not isinstance(v, str) and v not in (None, "", [], {}):
+                return v
+        return None
+
+    content = _pick(_IMPORT_CONTENT_KEYS)
+    if content is None:
+        all_keys = list(obj.keys())[:6] + (
+            [f"metadata.{k}" for k in nested.keys()][:6] if nested else []
+        )
+        raise ValueError(
+            f"no content field; tried {_IMPORT_CONTENT_KEYS}; got keys: {all_keys}"
+        )
+    if not isinstance(content, str):
+        content = str(content)
+
+    item = {
+        "type": default_type,
+        "content": content.strip(),
+        "importance": default_importance,
+    }
+
+    # Pull a type if present and valid
+    type_val = _pick(_IMPORT_TYPE_KEYS)
+    if type_val:
+        t = str(type_val).strip().lower()
+        if t in memory_v2.MEMORY_TYPES:
+            item["type"] = t
+
+    # Subject (NPC key / "user" / "self")
+    subj_val = _pick(_IMPORT_SUBJECT_KEYS)
+    if subj_val:
+        item["subject"] = str(subj_val).strip()
+
+    # Direct passthrough of recognized fields (from top level only — nested
+    # metadata stays as the "metadata" passthrough below)
+    for k in ("intensity", "tags", "status"):
+        if k in obj and obj[k] is not None:
+            item[k] = obj[k]
+    # Preserve any user-supplied metadata blob (LangChain shape, ST vectors
+    # extension shape) into our metadata field. Callers can grep on
+    # provenance later (e.g. "this row came from ST vectors export").
+    if nested:
+        item["metadata"] = nested
+    elif obj.get("metadata") is not None:
+        item["metadata"] = obj["metadata"]
+    if "importance" in obj and obj["importance"] is not None:
+        try:
+            item["importance"] = int(obj["importance"])
+        except (TypeError, ValueError):
+            pass
+    return item
+
+
+def _import_parse_jsonl(text: str, default_type: str, default_importance: int) -> list[dict]:
+    items = []
+    for i, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSONL parse error on line {i}: {e}")
+        items.append(_import_normalize(obj, default_type, default_importance))
+    return items
+
+
+def _import_parse_json(text: str, default_type: str, default_importance: int) -> list[dict]:
+    obj = json.loads(text)
+    if isinstance(obj, list):
+        return [_import_normalize(it, default_type, default_importance) for it in obj]
+    if isinstance(obj, dict):
+        # Common wrapper shapes: {memories: [...]}, {data: [...]}, etc.
+        for key in ("memories", "items", "entries", "data", "records", "rows"):
+            inner = obj.get(key)
+            if isinstance(inner, list):
+                return [_import_normalize(it, default_type, default_importance) for it in inner]
+        # Single object — treat as one memory
+        return [_import_normalize(obj, default_type, default_importance)]
+    raise ValueError(f"expected JSON array or object, got {type(obj).__name__}")
+
+
+def _import_parse_text(text: str, default_type: str, default_importance: int) -> list[dict]:
+    """Plain text → one memory per non-empty paragraph (split on blank line)."""
+    items = []
+    for chunk in re.split(r"\n\s*\n", text):
+        chunk = chunk.strip()
+        if chunk:
+            items.append({"type": default_type, "content": chunk, "importance": default_importance})
+    return items
+
+
+def _import_parse_csv(text: str, default_type: str, default_importance: int) -> list[dict]:
+    import csv as _csv
+    import io as _io
+    reader = _csv.DictReader(_io.StringIO(text))
+    items = []
+    for i, row in enumerate(reader, 1):
+        # csv.DictReader gives strings; normalize empty-string keys to None
+        cleaned = {k: v for k, v in row.items() if k and v}
+        if not cleaned:
+            continue
+        try:
+            items.append(_import_normalize(cleaned, default_type, default_importance))
+        except ValueError as e:
+            raise ValueError(f"CSV row {i}: {e}")
+    return items
+
+
+def _import_parse_markdown(text: str, default_type: str, default_importance: int) -> list[dict]:
+    """Split on H2 headers (## ...). If no H2 headers, fall back to paragraph splitting.
+
+    H2 sections turn into one memory each, with the heading prepended to the
+    body so context isn't lost. Use H1 (#) as a doc-level title (skipped).
+    """
+    # Strip a leading H1 title if present
+    body = re.sub(r"\A#\s+[^\n]+\n+", "", text)
+    parts = re.split(r"^##\s+(.+)$", body, flags=re.MULTILINE)
+    # parts: [pre_first_h2, heading1, body1, heading2, body2, ...]
+    items = []
+    if len(parts) > 1:
+        # Discard pre_first_h2 (anything before the first ## header)
+        for i in range(1, len(parts), 2):
+            heading = parts[i].strip()
+            body_text = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            content = f"{heading}\n{body_text}".strip() if body_text else heading
+            if content:
+                items.append({"type": default_type, "content": content, "importance": default_importance})
+        return items
+    # No H2 sections — fall through to paragraph splitting
+    return _import_parse_text(text, default_type, default_importance)
+
+
+def _import_auto_detect(text: str) -> str:
+    """Best-effort format guess from first non-empty line + global shape."""
+    s = text.lstrip()
+    if not s:
+        return "text"
+    first_line = s.splitlines()[0].strip()
+    # Whole-file JSON (array or object) — must parse cleanly
+    if first_line.startswith(("[", "{")):
+        try:
+            json.loads(s)
+            return "json"
+        except json.JSONDecodeError:
+            pass
+    # JSONL — first line is a JSON object alone
+    if first_line.startswith("{"):
+        try:
+            json.loads(first_line)
+            return "jsonl"
+        except json.JSONDecodeError:
+            pass
+    # Markdown — H2 headers somewhere
+    if re.search(r"^##\s+", s, flags=re.MULTILINE):
+        return "markdown"
+    # CSV — first line looks like a header (commas, no leading punctuation)
+    if "," in first_line and not first_line.startswith(("#", "-", "*")):
+        # Require at least one comma-separated field name that's identifier-ish
+        head = [h.strip() for h in first_line.split(",")]
+        if any(re.match(r"^[A-Za-z_][\w ]*$", h) for h in head):
+            return "csv"
+    return "text"
+
+
+_IMPORT_PARSERS = {
+    "jsonl": _import_parse_jsonl,
+    "json": _import_parse_json,
+    "text": _import_parse_text,
+    "csv": _import_parse_csv,
+    "markdown": _import_parse_markdown,
+}
+
+
+@app.route("/api/memory/<char_key>/import", methods=["POST"])
+def memory_import(char_key):
+    """Bulk-import memories into the v2 store.
+
+    Body (JSON):
+      text:               the memory dump as a string (required)
+      format:             "auto" | "jsonl" | "json" | "text" | "csv" | "markdown"
+      default_type:       memory type for items without one (default "fact")
+      default_importance: 1-5 (default 3)
+      dry_run:            bool — if true, parse + return preview but don't insert
+
+    Query params:
+      ?npc=<key>          scope insert into the NPC sub-DB instead of the
+                          character's main DB
+
+    Returns:
+      dry_run=true:  {format, count, preview}
+      dry_run=false: {format, imported, skipped, errors}
+    """
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "text is required and must be non-empty"}), 400
+
+    fmt = (data.get("format") or "auto").strip().lower()
+    default_type = (data.get("default_type") or "fact").strip().lower()
+    if default_type not in memory_v2.MEMORY_TYPES:
+        return jsonify({
+            "error": f"default_type must be one of {list(memory_v2.MEMORY_TYPES)}"
+        }), 400
+    try:
+        default_importance = int(data.get("default_importance", 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "default_importance must be an integer 1-5"}), 400
+    default_importance = max(1, min(5, default_importance))
+    dry_run = bool(data.get("dry_run", False))
+
+    if fmt == "auto":
+        fmt = _import_auto_detect(text)
+
+    parser = _IMPORT_PARSERS.get(fmt)
+    if not parser:
+        return jsonify({
+            "error": f"unknown format {fmt!r}; expected one of {list(_IMPORT_PARSERS)} or 'auto'"
+        }), 400
+
+    try:
+        items = parser(text, default_type, default_importance)
+    except ValueError as e:
+        return jsonify({"error": f"{fmt} parse error: {e}"}), 400
+    except json.JSONDecodeError as e:
+        return jsonify({"error": f"JSON parse error: {e}"}), 400
+    except Exception as e:
+        log(f"memory_import unexpected parser error ({fmt}): {e}", "ERROR")
+        return jsonify({"error": f"parser failure: {e}"}), 500
+
+    if not items:
+        return jsonify({
+            "format": fmt,
+            "count": 0,
+            "imported": 0,
+            "errors": ["no parseable entries found in the input"],
+        })
+
+    if dry_run:
+        # Preview clamps content for readability — full text comes through on
+        # the actual import.
+        preview = []
+        for it in items[:5]:
+            row = {k: v for k, v in it.items() if k != "embedding"}
+            if isinstance(row.get("content"), str) and len(row["content"]) > 240:
+                row["content"] = row["content"][:240] + "…"
+            preview.append(row)
+        return jsonify({"format": fmt, "count": len(items), "preview": preview})
+
+    # Live insert. Open the right connection (NPC sub-DB if requested).
+    npc_key = (request.args.get("npc") or "").strip() or None
+    conn = (
+        memory_v2.get_connection(char_key, npc_key=npc_key)
+        if npc_key else memory_v2.get_connection(char_key)
+    )
+    if conn is None:
+        return jsonify({"error": "no DB for this character/NPC — bootstrap it first"}), 404
+
+    current_turn = memory_v2.latest_turn(conn)
+    embedder_ready = memory_v2.embeddings_available()
+
+    inserted = 0
+    errors: list[str] = []
+    with memory_v2.transaction(conn):
+        for i, item in enumerate(items, 1):
+            try:
+                if "embedding" not in item and embedder_ready:
+                    emb = memory_v2.embed(str(item["content"]))
+                    if emb:
+                        item["embedding"] = emb
+                item.setdefault("created_turn", current_turn)
+                memory_v2.insert_memory(conn, **item)
+                inserted += 1
+            except (ValueError, TypeError) as e:
+                errors.append(f"item {i}: {e}")
+            except Exception as e:
+                errors.append(f"item {i}: unexpected error: {e}")
+
+    log(
+        f"memory_import [{char_key}{'/'+npc_key if npc_key else ''}] "
+        f"format={fmt} parsed={len(items)} inserted={inserted} errors={len(errors)}",
+        "SUCCESS" if inserted else "WARN",
+    )
+    return jsonify({
+        "format": fmt,
+        "imported": inserted,
+        "skipped": len(items) - inserted,
+        "errors": errors[:20],  # cap to keep payload sane
+        "embeddings_generated": embedder_ready,
+    })
 
 
 @app.route("/health", methods=["GET"])
@@ -4769,7 +5293,7 @@ CONVERSATION:
     full_prompt = summary_prompt + conv_text
     log(f"    Chunk {chunk_num} prompt: {len(full_prompt)} chars")
 
-    result = call_claude_code([{"role": "user", "content": full_prompt}])
+    result = call_claude_code([{"role": "user", "content": full_prompt}], skip_memory=True)
     response = result.get("response", "")
 
     if not response:
@@ -4811,7 +5335,7 @@ CONVERSATION:
 
     full_prompt = character_prompt + conv_text
 
-    result = call_claude_code([{"role": "user", "content": full_prompt}])
+    result = call_claude_code([{"role": "user", "content": full_prompt}], skip_memory=True)
     return result.get("response", "")
 
 
@@ -4904,7 +5428,7 @@ PARTIAL ANALYSES:
 """ + "\n\n---\n\n".join(f"[Part {i+1}]\n{r}" for i, r in enumerate(chunk_results))
 
         # Final combination call
-        final_result = call_claude_code([{"role": "user", "content": combine_prompt}])
+        final_result = call_claude_code([{"role": "user", "content": combine_prompt}], skip_memory=True)
 
         log("  Done!")
         log("=" * 50)
