@@ -3874,7 +3874,22 @@ Now, based on this context, please respond to the following request:
         worker_thread.start()
 
         def response_generator(as_sse: bool):
-            keepalive = ": keepalive\n\n" if as_sse else " "
+            if as_sse:
+                # Send a real empty-delta SSE data event instead of a comment.
+                # SSE comments (": keepalive") are skipped by OpenAI-compatible
+                # clients like TomoriBot, so their inactivity timers never reset
+                # while Claude is thinking.  A proper but empty chunk keeps those
+                # timers alive and is a no-op for all compliant streaming clients.
+                _kl_payload = json.dumps({
+                    "id": "keepalive",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": DEFAULT_MODEL,
+                    "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}],
+                })
+                keepalive = f"data: {_kl_payload}\n\n"
+            else:
+                keepalive = " "
             try:
                 while worker_thread.is_alive():
                     worker_thread.join(timeout=1.0)
